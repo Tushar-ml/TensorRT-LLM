@@ -19,11 +19,11 @@ class EAGLERotaryEmbedding(Module):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = arange(self.max_seq_len_cached, dtype=self.inv_freq.dtype)
+        t = torch.arange(self.max_seq_len_cached, dtype=self.inv_freq.dtype)
 
-        freqs = einsum("i,j->ij", [t, self.inv_freq])
+        freqs = torch.einsum("i,j->ij", [t, self.inv_freq])
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = concat((freqs, freqs), dim=-1)
+        emb = torch.cat((freqs, freqs), dim=-1)
         self.register_parameter("cos_cached", emb.cos()[None, None, :, :].to(dtype))
         self.register_parameter("sin_cached", emb.sin()[None, None, :, :].to(dtype))
 

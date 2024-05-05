@@ -1157,15 +1157,72 @@ if __name__ == '__main__':
                     torch_dtype = str_dtype_to_torch(dtype)
                     weights = {}
 
+                    prefix = "layers.0."
+                    q_weight = get_weight(state_dict, prefix + 'self_attn.q_proj', torch_dtype)
+                    k_weight = get_weight(state_dict, prefix + 'self_attn.k_proj', torch_dtype)
+                    v_weight = get_weight(state_dict, prefix + 'self_attn.v_proj', torch_dtype)
+
+
+                    qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+                    split_v = split_qkv_tp(qkv_weight, args.n_head, args.n_embd,
+                                        mapping.tp_size, mapping.tp_rank)
+                    
+                    weights.update(get_tllm_linear_weight(split_v, "transformer.layers.0.attention.qkv.", None,args.use_weight_only,
+                                                          plugin_weight_only_quant_type))
+
+                    mlp_gate_weight = get_weight(state_dict, prefix + 'mlp.up_proj',
+                                     torch_dtype)
+                    split_v = split_matrix_tp(mlp_gate_weight,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=0)
+                    
+                    weights.update(
+                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.gate.", None,
+                                            args.use_weight_only,
+                                            plugin_weight_only_quant_type))
+
+                    
+                    mlp_gate_weight = get_weight(state_dict, prefix + 'mlp.gate_proj',
+                                     torch_dtype)
+                    split_v = split_matrix_tp(mlp_gate_weight,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=0)
+                    
+                    weights.update(
+                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.fc.", None,
+                                            args.use_weight_only,
+                                            plugin_weight_only_quant_type))
+                    
+
+                    mlp_gate_weight = get_weight(state_dict, prefix + 'mlp.down_proj',
+                                     torch_dtype)
+                    split_v = split_matrix_tp(mlp_gate_weight,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=0)
+                    
+                    weights.update(
+                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.proj.", None,
+                                            args.use_weight_only,
+                                            plugin_weight_only_quant_type))
+                    
+
                     for key in state_dict.keys():
+                        if "self_attn" in key or "mlp" in key:
+                            continue
+
                         if key.endswith(".weight"):
                             w = state_dict[key].clone().to(
                                 torch_dtype)
 
-                            split_v = split(w, mapping.tp_size, mapping.tp_rank)
+                            split_v = split_matrix_tp(w, mapping.tp_size, mapping.tp_rank, dim = 0)
+                            key = key.replace("post_attention_layernorm", "post_layernorm")
                             weights.update(
                                 get_tllm_linear_weight(split_v,
-                                                        f'ea_layers.{key.replace("weight","")}',
+                                                        f'transformer.{key.replace("weight","")}',
                                                         None, args.use_weight_only, plugin_weight_only_quant_type
                                                         )
                             )
@@ -1173,15 +1230,22 @@ if __name__ == '__main__':
                             b = state_dict[key].clone().to(
                                 torch_dtype)
 
-                            weights[f'ea_layers.{key}'] = split(b, mapping.tp_size,
+                            weights[f'transformer.{key}'] = split(b, mapping.tp_size,
                                                         mapping.tp_rank)
 
                     return weights
 
+                for key in weights.keys():
+                    print(key)
+
                 eagle_weights = load_eagle_hf(args.eagle_model_dir,
                                                 mapping,
                                                 dtype=args.dtype)
+                print("========================================")
+                for key in eagle_weights.keys():
+                    print(key)
                 weights.update(eagle_weights)
+
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...models.llama.model import LLaMAForCausalLM
-from .utils import *
-from .layers import *
+from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+from utils import *
+from layers import *
 from transformers.configuration_utils import PretrainedConfig
-from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
-from ...layers import ColumnLinear
-from ...layers.attention import make_causal_mask
-from ...layers.normalization import RmsNorm
-from ...layers.embedding import Embedding
-from ...module import Module, ModuleList
+from tensorrt_llm.functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
+from tensorrt_llm.layers import ColumnLinear, Attention
+from tensorrt_llm.layers.attention import make_causal_mask
+from tensorrt_llm.layers.normalization import RmsNorm
+from tensorrt_llm.layers.embedding import Embedding
+from tensorrt_llm.module import Module, ModuleList
 from typing import Optional, Tuple, List
-from ..._common import default_net
+from tensorrt_llm._common import default_net
 from transformers.models.llama.modeling_llama import repeat_kv
 import math
 
@@ -249,17 +249,17 @@ class EAGLEMLP(Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = ColumnLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.fc = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.gate = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.proj = ColumnLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+            gate_proj_slices = self.fc.weight.split(slice, dim=0)
+            up_proj_slices = self.gate.weight.split(slice, dim=0)
+            down_proj_slices = self.proj.weight.split(slice, dim=1)
 
             gate_proj = concat(
                 [ColumnLinear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
@@ -284,13 +284,17 @@ class EAGLEDecoderLayer(Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.self_attn = EagleAttention(config)
+        # self.self_attn = EagleAttention(config)
+        self.attention = Attention(local_layer_idx=index, hidden_size=config.hidden_size,
+                                   num_attention_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads,
+                                   max_position_embeddings=config.max_position_embeddings, num_layers=config.num_hidden_layers,
+                                   rotary_embedding_scaling=config.rope_scaling, bias = False)
         
         self.mlp = EAGLEMLP(config)
         self.index = index
         if self.index != 0:
             self.input_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
                     self,
@@ -307,7 +311,7 @@ class EAGLEDecoderLayer(Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value = self.self_attn(
+        hidden_states, present_key_value = self.attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask
         )
@@ -317,7 +321,7 @@ class EAGLEDecoderLayer(Module):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -331,11 +335,10 @@ class EAGLEDecoderLayer(Module):
 class EAGLEModel(Module):
 
     def __init__(
-            self,config: EAGLEConfig, bias: bool =True
+            self,config, bias: bool =True
     ):
         super().__init__()
         self.gradient_checkpointing = False
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
 
@@ -437,30 +440,14 @@ class EAGLEModel(Module):
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
-            if self.gradient_checkpointing and self.training:
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, past_key_value, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
 
             hidden_states = layer_outputs[0]
 
@@ -605,17 +592,17 @@ class EagleForCausalLM(LLaMAForCausalLM):
     def __init__(self, config):
         
         super().__init__(config)
-        bias = config.get("bias", True)
-        self.ea_layer = EAGLEModel(config, bias=bias)
+
+        bias = False
+        self.transformer = EAGLEModel(config, bias=bias)
         device = "cuda"
 
-        self.ea_layer.to(torch.float32).to(device)
-        self.ea_layer.device = device
-        self.ea_layer.diff_device = False
-        self.ea_layer.tree = tree_structure
+        self.transformer.device = device
+        self.transformer.diff_device = False
+        self.transformer.tree = tree_structure
         self.tree = tree_structure
 
-        self.ea_layer.init_tree()
+        self.transformer.init_tree()
 
     def forward(self, *args, **kwargs):
 
@@ -656,24 +643,12 @@ class EagleForCausalLM(LLaMAForCausalLM):
     
 if __name__ == "__main__":
 
-    # from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    # base_model = "/models/model_input/vicuna-7b-v1.3"
-    eagle_path = "/models/model_input/EAGLE-Vicuna-7B-v1.3"
+    text = "Hi how are you"
+    tokenizer = AutoTokenizer.from_pretrained("/models/model_input/vicuna-7b-v1.3")
+    model = EagleForCausalLM.from_checkpoint("/models/model_output/eagle_model")
 
-    weights = {}
+    input_id = tokenizer(text, return_tensors="pt")
 
-    import torch
-    a = torch.load(eagle_path, "cpu")
-    ea_layer_prefix = "ea_layers."
-
-    for key, value in a.items():
-        weights[ea_layer_prefix + key] = value
-
-    from safetensors.torch import save_file
-
-    save_file(weights, "rank0.safetensors")
-    # from transformers import LlamaConfig
-    # config = LlamaConfig.from_json_file(eagle_path + "config.json")
-    # model = EagleForCausalLM.from_checkpoint("rank0.safetensors", config=config)
-    # print(model)
+    print(model(**input_id))

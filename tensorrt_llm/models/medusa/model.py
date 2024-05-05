@@ -16,7 +16,7 @@ from collections import OrderedDict
 
 import tensorrt as trt
 
-from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+from ...models.llama.model import LLaMAForCausalLM
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
