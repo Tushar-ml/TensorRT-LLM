@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm.models.llama.model import LLaMAForCausalLM
-from utils import *
-from layers import *
+from ...models.llama.model import LLaMAForCausalLM
+from .utils import *
+from .layers import *
 from transformers.configuration_utils import PretrainedConfig
-from tensorrt_llm.functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
-from tensorrt_llm.layers import ColumnLinear
-from tensorrt_llm.layers.attention import make_causal_mask
-from tensorrt_llm.layers.normalization import RmsNorm
-from tensorrt_llm.layers.embedding import Embedding
-from tensorrt_llm.module import Module, ModuleList
+from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
+from ...layers import ColumnLinear
+from ...layers.attention import make_causal_mask
+from ...layers.normalization import RmsNorm
+from ...layers.embedding import Embedding
+from ...module import Module, ModuleList
 from typing import Optional, Tuple, List
-from tensorrt_llm._common import default_net
+from ..._common import default_net
 from transformers.models.llama.modeling_llama import repeat_kv
 import math
 
@@ -343,14 +343,11 @@ class EAGLEModel(Module):
             EAGLEDecoderLayer(config, index) for index in range(config.num_hidden_layers)
         ])
 
-        print("EagleModel Layers: ", self.layers[0].self_attn.q_proj.weight)
-
         self.fc = ColumnLinear(2*config.hidden_size,
                                     config.hidden_size,
                                     bias=bias)
         
         self.act = ACT2FN[config.hidden_act]
-        self.lm_head = ColumnLinear(config.hidden_size, config.vocab_size, bias = False)
 
     def init_tree(self):
         self.tree_buffer = generate_tree_buffers_for_eagle(self.tree, "cuda")
@@ -634,7 +631,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
         logits_processor = kwargs["logits_processor"]
 
         if output_original:
-            orig = self.ea_layer.lm_head(hidden_states)
+            orig = super().lm_head(hidden_states)
         if kwargs["init"]:
             if logits_processor is not None:
                 logits = orig[:, -1]
@@ -648,7 +645,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             input_ids = concat((input_ids, token.to(input_ids.device)), dim=1)
             # Clone the output hidden states
 
-            ea_logits = self.ea_layer.topK_generate(hidden_states, input_ids, self.ea_layer.lm_head, kwargs["logits_processor"],attention_mask=kwargs["attention_mask"])
+            ea_logits = self.ea_layer.topK_generate(hidden_states, input_ids, super().lm_head, kwargs["logits_processor"],attention_mask=kwargs["attention_mask"])
             if output_original:
                 return ea_logits, orig, hidden_states, token
             
@@ -662,20 +659,21 @@ if __name__ == "__main__":
     # from transformers import AutoTokenizer, AutoModelForCausalLM
 
     # base_model = "/models/model_input/vicuna-7b-v1.3"
-    eagle_path = "/models/model_input/EAGLE-Vicuna-7B-v1.3/"
+    eagle_path = "/models/model_input/EAGLE-Vicuna-7B-v1.3"
 
-    # weights = {}
+    weights = {}
 
-    # import torch
-    # a = torch.load(eagle_path, "cpu")
-    # ea_layer_prefix = "ea_layers."
+    import torch
+    a = torch.load(eagle_path, "cpu")
+    ea_layer_prefix = "ea_layers."
 
-    # for key, value in a.items():
-    #     weights[ea_layer_prefix + key] = value
+    for key, value in a.items():
+        weights[ea_layer_prefix + key] = value
 
-    # from safetensors.torch import save_file
+    from safetensors.torch import save_file
 
-    # save_file(weights, "rank0.safetensors")
-    config = EAGLEConfig.from_json_file(eagle_path + "config.json")
-    model = EagleForCausalLM.from_checkpoint("rank0.safetensors", config=config)
-    print(model)
+    save_file(weights, "rank0.safetensors")
+    # from transformers import LlamaConfig
+    # config = LlamaConfig.from_json_file(eagle_path + "config.json")
+    # model = EagleForCausalLM.from_checkpoint("rank0.safetensors", config=config)
+    # print(model)
