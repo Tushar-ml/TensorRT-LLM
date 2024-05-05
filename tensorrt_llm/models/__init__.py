@@ -33,6 +33,7 @@ from .opt.model import OPTForCausalLM, OPTModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
+from .eagle.model import EagleForCausalLM
 
 __all__ = [
     'BertModel',
@@ -71,6 +72,7 @@ __all__ = [
     'GemmaForCausalLM',
     'DbrxForCausalLM',
     'RecurrentGemmaForCausalLM',
+    'EagleForCausalLM'
 ]
 
 MODEL_MAP = {
@@ -97,4 +99,5 @@ MODEL_MAP = {
     'DecoderModel': DecoderModel,
     'DbrxForCausalLM': DbrxForCausalLM,
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
+    'EagleForCausalLM': EagleForCausalLM,
 }
