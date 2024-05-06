@@ -1022,6 +1022,7 @@ if __name__ == '__main__':
         'hidden_act': args.hidden_act,
         'rope_scaling': args.rotary_scaling,
         'rms_norm_eps': args.rms_norm_eps,
+        "pretraining_tp": 1,
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
@@ -1168,9 +1169,19 @@ if __name__ == '__main__':
                     split_v = split_qkv_tp(qkv_weight, args.n_head, args.n_embd,
                                         mapping.tp_size, mapping.tp_rank)
                     
-                    weights.update(get_tllm_linear_weight(split_v, "transformer.layers.0.attention.qkv.", None,args.use_weight_only,
+                    weights.update(get_tllm_linear_weight(split_v, "ea_layer.layers.0.self_attn.qkv.", None,args.use_weight_only,
                                                           plugin_weight_only_quant_type))
 
+                    attn_dense_weight = get_weight(state_dict,
+                                       prefix + 'self_attn.o_proj', torch_dtype)
+                    split_v = split_matrix_tp(attn_dense_weight,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=1)
+                    weights.update(
+                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.self_attn.dense.",
+                                            None, args.use_weight_only,
+                                            plugin_weight_only_quant_type))
                     mlp_gate_weight = get_weight(state_dict, prefix + 'mlp.up_proj',
                                      torch_dtype)
                     split_v = split_matrix_tp(mlp_gate_weight,
@@ -1179,7 +1190,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.gate.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.gate.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
 
@@ -1192,7 +1203,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.fc.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.fc.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
                     
@@ -1205,7 +1216,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "transformers.layers.0.mlp.proj.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.proj.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
                     
@@ -1222,7 +1233,7 @@ if __name__ == '__main__':
                             key = key.replace("post_attention_layernorm", "post_layernorm")
                             weights.update(
                                 get_tllm_linear_weight(split_v,
-                                                        f'transformer.{key.replace("weight","")}',
+                                                        f'ea_layer.{key.replace("weight","")}',
                                                         None, args.use_weight_only, plugin_weight_only_quant_type
                                                         )
                             )
@@ -1230,7 +1241,7 @@ if __name__ == '__main__':
                             b = state_dict[key].clone().to(
                                 torch_dtype)
 
-                            weights[f'transformer.{key}'] = split(b, mapping.tp_size,
+                            weights[f'ea_layer.{key}'] = split(b, mapping.tp_size,
                                                         mapping.tp_rank)
 
                     return weights

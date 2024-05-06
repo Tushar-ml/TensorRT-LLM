@@ -13,20 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm.models.llama.model import LLaMAForCausalLM
-from utils import *
-from layers import *
+from ...models.llama.model import LLaMAForCausalLM
+from .utils import *
+from .layers import *
 from transformers.configuration_utils import PretrainedConfig
-from tensorrt_llm.functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
-from tensorrt_llm.layers import ColumnLinear, Attention
-from tensorrt_llm.layers.attention import make_causal_mask
-from tensorrt_llm.layers.normalization import RmsNorm
-from tensorrt_llm.layers.embedding import Embedding
-from tensorrt_llm.module import Module, ModuleList
+from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
+from ...layers import ColumnLinear, Attention
+from ...layers.attention import make_causal_mask
+from ...layers.normalization import RmsNorm
+from ...layers.embedding import Embedding
+from ...module import Module, ModuleList
 from typing import Optional, Tuple, List
-from tensorrt_llm._common import default_net
+from ..._common import default_net
 from transformers.models.llama.modeling_llama import repeat_kv
 import math
+from ...mapping import Mapping
 
 class EAGLEConfig(PretrainedConfig):
     
@@ -105,16 +106,18 @@ class EAGLEConfig(PretrainedConfig):
 
 class EagleAttention(Module):
 
-    def __init__(self, config: EAGLEConfig):
+    def __init__(self, hidden_size, num_attention_heads, num_key_value_heads, max_position_embeddings,
+                 rope_scaling, pretraining_tp):
 
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.hidden_size = hidden_size
+        self.num_heads = num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_scaling = rope_scaling
+        self.pretraining_tp = pretraining_tp
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -129,11 +132,11 @@ class EagleAttention(Module):
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        if self.rope_scaling is None:
             self.rotary_emb = EAGLERotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_type = self.rope_scaling["type"]
+            scaling_factor = self.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = EAGLELinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
@@ -159,21 +162,21 @@ class EagleAttention(Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tuple[Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+        if self.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.pretraining_tp
             query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+                (self.num_heads * self.head_dim) // self.pretraining_tp, dim=0
             )
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
-            query_states = [ColumnLinear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            query_states = [ColumnLinear(hidden_states, query_slices[i]) for i in range(self.pretraining_tp)]
             query_states = concat(query_states, dim=-1)
 
-            key_states = [ColumnLinear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+            key_states = [ColumnLinear(hidden_states, key_slices[i]) for i in range(self.pretraining_tp)]
             key_states = concat(key_states, dim=-1)
 
-            value_states = [ColumnLinear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+            value_states = [ColumnLinear(hidden_states, value_slices[i]) for i in range(self.pretraining_tp)]
             value_states = concat(value_states, dim=-1)
 
         else:
@@ -230,10 +233,10 @@ class EagleAttention(Module):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([ColumnLinear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+        if self.pretraining_tp > 1:
+            attn_output = attn_output.split(self.hidden_size // self.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.pretraining_tp, dim=1)
+            attn_output = sum([ColumnLinear(attn_output[i], o_proj_slices[i]) for i in range(self.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)
 
@@ -243,58 +246,63 @@ class EagleAttention(Module):
         return attn_output, attn_weights, past_key_value
 
 class EAGLEMLP(Module):
-    def __init__(self, config: EAGLEConfig):
+    def __init__(self, intermediate_size,
+                 hidden_size, hidden_act, pretraining_tp):
 
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.pretraining_tp = pretraining_tp
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.fc = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
         self.gate = ColumnLinear(self.hidden_size, self.intermediate_size, bias=False)
         self.proj = ColumnLinear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
+        if self.pretraining_tp > 1:
+            slice = self.intermediate_size // self.pretraining_tp
             gate_proj_slices = self.fc.weight.split(slice, dim=0)
             up_proj_slices = self.gate.weight.split(slice, dim=0)
             down_proj_slices = self.proj.weight.split(slice, dim=1)
 
             gate_proj = concat(
-                [ColumnLinear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
+                [ColumnLinear(x, gate_proj_slices[i]) for i in range(self.pretraining_tp)], dim=-1
             )
-            up_proj = concat([ColumnLinear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+            up_proj = concat([ColumnLinear(x, up_proj_slices[i]) for i in range(self.pretraining_tp)], dim=-1)
 
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
             down_proj = [
-                ColumnLinear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
+                ColumnLinear(intermediate_states[i], down_proj_slices[i]) for i in range(self.pretraining_tp)
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            down_proj = self.proj(self.act_fn(self.fc(x)) * self.gate(x))
 
 
         return down_proj
       
 class EAGLEDecoderLayer(Module):
 
-    def __init__(self, config:EAGLEConfig,index):
+    def __init__(self,index,
+                 hidden_size, num_key_value_heads, num_attention_heads,
+                 max_position_embeddings, num_hidden_layers,rope_scaling,
+                 rms_norm_eps, intermediate_size, pretraining_tp, hidden_act):
 
         super().__init__()
 
-        self.hidden_size = config.hidden_size
-        # self.self_attn = EagleAttention(config)
-        self.attention = Attention(local_layer_idx=index, hidden_size=config.hidden_size,
-                                   num_attention_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads,
-                                   max_position_embeddings=config.max_position_embeddings, num_layers=config.num_hidden_layers,
-                                   rotary_embedding_scaling=config.rope_scaling, bias = False)
+        self.hidden_size = hidden_size
+        # self.self_attn = EagleAttention(hidden_size, num_attention_heads,
+        #                                 num_key_value_heads, max_position_embeddings, rope_scaling, pretraining_tp)
+        self.self_attn = Attention(local_layer_idx=index, hidden_size=hidden_size,
+                                   num_attention_heads=num_attention_heads, num_kv_heads=num_key_value_heads,
+                                   max_position_embeddings=max_position_embeddings, num_layers=num_hidden_layers,
+                                   rotary_embedding_scaling=rope_scaling, bias = False)
         
-        self.mlp = EAGLEMLP(config)
+        self.mlp = EAGLEMLP(intermediate_size, hidden_size, hidden_act, pretraining_tp)
         self.index = index
         if self.index != 0:
-            self.input_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_layernorm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.input_layernorm = RmsNorm(hidden_size, eps=rms_norm_eps)
+        self.post_layernorm = RmsNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(
                     self,
@@ -311,7 +319,7 @@ class EAGLEDecoderLayer(Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, present_key_value = self.attention(
+        hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask
         )
@@ -335,22 +343,31 @@ class EAGLEDecoderLayer(Module):
 class EAGLEModel(Module):
 
     def __init__(
-            self,config, bias: bool =True
+            self,vocab_size, hidden_size,
+            num_hidden_layers,
+            hidden_act,
+            num_kv_heads,
+            num_attention_heads,
+            max_position_embeddings, rope_scaling, rms_norm_eps, intermediate_size,
+            pretraining_tp,
+            bias: bool =True
     ):
         super().__init__()
         self.gradient_checkpointing = False
-        self.vocab_size = config.vocab_size
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+        self.vocab_size = vocab_size
+        self.embed_tokens = Embedding(vocab_size, hidden_size)
 
         self.layers = ModuleList([
-            EAGLEDecoderLayer(config, index) for index in range(config.num_hidden_layers)
+            EAGLEDecoderLayer(index,hidden_size, num_kv_heads, num_attention_heads,
+                              max_position_embeddings, num_hidden_layers, rope_scaling, rms_norm_eps,
+                              intermediate_size, pretraining_tp, hidden_act) for index in range(1)
         ])
 
-        self.fc = ColumnLinear(2*config.hidden_size,
-                                    config.hidden_size,
+        self.fc = ColumnLinear(2*hidden_size,
+                                    hidden_size,
                                     bias=bias)
         
-        self.act = ACT2FN[config.hidden_act]
+        self.act = ACT2FN[hidden_act]
 
     def init_tree(self):
         self.tree_buffer = generate_tree_buffers_for_eagle(self.tree, "cuda")
@@ -392,14 +409,14 @@ class EAGLEModel(Module):
 
     def forward(
             self,
-            hidden_states,
             input_ids,
+            hidden_states: Optional[Tensor] = None,
             attention_mask: Optional[Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,**kwargs
     ):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
@@ -589,25 +606,37 @@ class EAGLEModel(Module):
 
 class EagleForCausalLM(LLaMAForCausalLM):
 
-    def __init__(self, config):
+    def __init__(self, config, mapping = Mapping()):
         
         super().__init__(config)
 
         bias = False
-        self.transformer = EAGLEModel(config, bias=bias)
+        self.ea_layer = EAGLEModel(config.vocab_size, config.hidden_size,
+                                   config.num_hidden_layers, config.hidden_act,
+                                   config.num_key_value_heads, config.num_attention_heads,
+                                   config.max_position_embeddings, config.rope_scaling, config.rms_norm_eps, config.intermediate_size,
+                                   config.pretraining_tp)
         device = "cuda"
 
-        self.transformer.device = device
-        self.transformer.diff_device = False
-        self.transformer.tree = tree_structure
+        self.ea_layer.device = device
+        self.ea_layer.diff_device = False
+        self.ea_layer.tree = tree_structure
         self.tree = tree_structure
 
-        self.transformer.init_tree()
+        self.ea_layer.init_tree()
+        self.lm_head = ColumnLinear(config.hidden_size,
+                                    config.vocab_size,
+                                    bias=False,
+                                    dtype=config.dtype,
+                                    tp_group=mapping.tp_group,
+                                    tp_size=mapping.tp_size,
+                                    gather_output=True)
 
     def forward(self, *args, **kwargs):
 
         output_original = True
         hidden_states = super().forward(*args, **kwargs)
+        input_ids = kwargs["input_ids"]
 
         if kwargs['use_cache']:
             if default_net().plugin_config.paged_kv_cache:
@@ -615,11 +644,12 @@ class EagleForCausalLM(LLaMAForCausalLM):
             else:
                 lm_logits, presents, hidden_states = hidden_states
 
-        logits_processor = kwargs["logits_processor"]
+        logits_processor = kwargs.get("logits_processor", None)
 
         if output_original:
-            orig = super().lm_head(hidden_states)
-        if kwargs["init"]:
+            orig: torch.Tensor = self.lm_head(hidden_states)
+            print("Orig: ", orig)
+        if kwargs.get("init", True):
             if logits_processor is not None:
                 logits = orig[:, -1]
                 logits = logits_processor(None, logits)
@@ -627,12 +657,14 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 token = torch.multinomial(probabilities, 1)
             else:
                 token = argmax(orig[:, -1],dim=-1)
-                token = token[:,None]
-            
-            input_ids = concat((input_ids, token.to(input_ids.device)), dim=1)
+                # token = token[:,None]
+            print("Token: ", dir(token))
+            input_ids = concat((input_ids, token), dim=0)
             # Clone the output hidden states
 
-            ea_logits = self.ea_layer.topK_generate(hidden_states, input_ids, super().lm_head, kwargs["logits_processor"],attention_mask=kwargs["attention_mask"])
+            print(input_ids)
+
+            ea_logits = self.ea_layer.topK_generate(hidden_states, input_ids, self.lm_head, logits_processor,attention_mask=kwargs.get("attention_mask", None))
             if output_original:
                 return ea_logits, orig, hidden_states, token
             
