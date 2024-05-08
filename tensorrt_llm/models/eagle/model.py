@@ -17,8 +17,8 @@ from ...models.llama.model import LLaMAForCausalLM
 from .utils import *
 from .layers import *
 from transformers.configuration_utils import PretrainedConfig
-from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, argmax
-from ...layers import ColumnLinear, Attention
+from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, unsqueeze, view, shape
+from ...layers import ColumnLinear, Attention, AttentionMaskType
 from ...layers.attention import make_causal_mask
 from ...layers.normalization import RmsNorm
 from ...layers.embedding import Embedding
@@ -28,6 +28,7 @@ from ..._common import default_net
 from transformers.models.llama.modeling_llama import repeat_kv
 import math
 from ...mapping import Mapping
+import tensorrt as trt
 
 class EAGLEConfig(PretrainedConfig):
     
@@ -296,7 +297,7 @@ class EAGLEDecoderLayer(Module):
         self.self_attn = Attention(local_layer_idx=index, hidden_size=hidden_size,
                                    num_attention_heads=num_attention_heads, num_kv_heads=num_key_value_heads,
                                    max_position_embeddings=max_position_embeddings, num_layers=num_hidden_layers,
-                                   rotary_embedding_scaling=rope_scaling, bias = False)
+                                   rotary_embedding_scaling=rope_scaling, bias = False, attention_mask_type=AttentionMaskType.causal)
         
         self.mlp = EAGLEMLP(intermediate_size, hidden_size, hidden_act, pretraining_tp)
         self.index = index
@@ -311,6 +312,7 @@ class EAGLEDecoderLayer(Module):
                     position_ids: Optional[torch.LongTensor] = None,
                     past_key_value: Optional[Tuple[Tensor]] = None,
                     use_cache: Optional[bool] = False,
+                    attention_params: Optional[Tensor] = None, kv_cache_params = None, **kwargs
             ):
 
         residual = hidden_states
@@ -321,10 +323,11 @@ class EAGLEDecoderLayer(Module):
         # Self Attention
         hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            attention_params = attention_params,
+            kv_cache_params = kv_cache_params, use_cache = use_cache
         )
 
-    
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -383,15 +386,13 @@ class EAGLEModel(Module):
             combined_attention_mask = make_causal_mask(
                 input_shape[0],
                 input_shape[1],
-                dtype=torch.float32,
+                dtype=trt.DataType.FLOAT,
                 past_key_values_length=past_key_values_length,
             )
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = expand_mask(attention_mask, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
-            )
+            expanded_attn_mask = expand_mask(attention_mask, tgt_len=input_shape[-1])
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
@@ -409,16 +410,18 @@ class EAGLEModel(Module):
 
     def forward(
             self,
+            hidden_states,
             input_ids,
-            hidden_states: Optional[Tensor] = None,
             attention_mask: Optional[Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,**kwargs
-    ):
-        batch_size, seq_length, _ = hidden_states.shape
+            output_hidden_states: Optional[bool] = None,
+            attention_params: Optional[Tensor] = None, **kwargs
+    ):  
+        
+        batch_size, seq_length = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
@@ -429,23 +432,31 @@ class EAGLEModel(Module):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = hidden_states.device if hidden_states is not None else inputs_embeds.device
-            position_ids = arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long
+            device = "cpu"
+            position_ids:Tensor = arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype="int64"
             )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            position_ids = view(unsqueeze(position_ids,0),(-1, seq_length))
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            position_ids = view(position_ids, (-1, seq_length))
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
+        print("Position IDs: ", position_ids)
+        """
+        python3 ../run.py --max_output_len=50 \
+                  --tokenizer_dir /models/model_input/vicuna-7b-1.3 \
+                  --engine_dir=/models/model_output/eagle_model_engine
+        """
+        # if attention_mask is None:
+        #     attention_mask = Tensor("attention_mask",trt.DataType.INT32, (batch_size, seq_length_with_past))
+
+        print("Attention Mask: ", attention_mask)
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+            attention_mask, (shape(hidden_states,0), shape(hidden_states,1)), hidden_states, past_key_values_length
         )
 
-        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        print("Attention Mask: ", attention_mask)
+
+        inputs_embeds = inputs_embeds
         hidden_states = self.fc(concat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
@@ -463,16 +474,13 @@ class EAGLEModel(Module):
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
-                use_cache=use_cache,
+                use_cache=use_cache,attention_params = attention_params, kv_cache_params = kwargs["kv_cache_params"]
             )
 
             hidden_states = layer_outputs[0]
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
-
-        if use_cache:
-            return hidden_states, next_decoder_cache
 
         return hidden_states
 
@@ -631,47 +639,38 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                     tp_group=mapping.tp_group,
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
-
+        
     def forward(self, *args, **kwargs):
-
         output_original = True
         hidden_states = super().forward(*args, **kwargs)
-        input_ids = kwargs["input_ids"]
-
+        print(args, kwargs)
         if kwargs['use_cache']:
             if default_net().plugin_config.paged_kv_cache:
                 lm_logits, hidden_states = hidden_states
             else:
                 lm_logits, presents, hidden_states = hidden_states
 
-        logits_processor = kwargs.get("logits_processor", None)
-
-        if output_original:
-            orig: torch.Tensor = self.lm_head(hidden_states)
-            print("Orig: ", orig)
-        if kwargs.get("init", True):
-            if logits_processor is not None:
-                logits = orig[:, -1]
-                logits = logits_processor(None, logits)
-                probabilities = softmax(logits, dim=-1)
-                token = torch.multinomial(probabilities, 1)
-            else:
-                token = argmax(orig[:, -1],dim=-1)
-                # token = token[:,None]
-            print("Token: ", dir(token))
-            input_ids = concat((input_ids, token), dim=0)
-            # Clone the output hidden states
-
-            print(input_ids)
-
-            ea_logits = self.ea_layer.topK_generate(hidden_states, input_ids, self.lm_head, logits_processor,attention_mask=kwargs.get("attention_mask", None))
-            if output_original:
-                return ea_logits, orig, hidden_states, token
+        if self.mapping.is_last_pp_rank():
             
-            return ea_logits, hidden_states, token
+            eagle_logits: Tensor = self.ea_layer(hidden_states, **kwargs)
+            eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
         else:
-            if output_original:
-                return orig, hidden_states
+            hidden_states.mark_output('hidden_states_output', self.config.dtype)
+
+        print("Eagle Logits: ", eagle_logits, "Hidden States: ", hidden_states)
+        if kwargs['use_cache'] and default_net(
+        ).plugin_config.paged_kv_cache == False:
+            if self.mapping.is_last_pp_rank():
+                if output_original:
+                    return (eagle_logits, lm_logits, presents)
+                return (eagle_logits, presents)
+            return (hidden_states, presents)
+        else:
+            if self.mapping.is_last_pp_rank():
+                if output_original:
+                    return eagle_logits, lm_logits
+                return eagle_logits
+            return hidden_states
     
 if __name__ == "__main__":
 

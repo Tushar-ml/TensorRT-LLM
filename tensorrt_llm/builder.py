@@ -235,6 +235,7 @@ class Builder():
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
             profile = self.trt_builder.create_optimization_profile()
             for input_name in input_tensors.keys():
+                print(input_name, input_tensors[input_name].profiles)
                 shape_profile = input_tensors[input_name].profiles[i]
                 min_shape = [*shape_profile.min]
                 opt_shape = [*shape_profile.opt]
