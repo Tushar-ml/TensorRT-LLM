@@ -394,6 +394,7 @@ class ModelConfig:
     conv_kernel: int = 0
     layer_types: List[str] = field(default_factory=list)
     rnn_hidden_size: int = 0
+    use_eagle: bool = False
 
 
 @dataclass
@@ -773,6 +774,9 @@ class GenerationSession(object):
             if self.cross_attention and self.remove_input_padding:
                 expected_tensor_names += ['host_encoder_input_lengths']
 
+        # if model_config.use_eagle:
+        #     expected_tensor_names += ["eagle_logits"]
+
         if model_config.num_medusa_heads > 0:
             expected_tensor_names += [
                 'medusa_position_offsets', 'medusa_packed_mask', 'medusa_logits'
@@ -784,14 +788,14 @@ class GenerationSession(object):
         ]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
-            logger.error(
+            print(
                 f"The following expected tensors are not found: {set(expected_tensor_names).difference(set(found_tensor_names))}"
             )
-            logger.error(
+            print(
                 f"Those tensors in engine are not expected: {set(found_tensor_names).difference(set(expected_tensor_names))}"
             )
-            logger.error(f"Expected tensor names: {expected_tensor_names}")
-            logger.error(f"Found tensor names: {found_tensor_names}")
+            print(f"Expected tensor names: {expected_tensor_names}")
+            print(f"Found tensor names: {found_tensor_names}")
             raise RuntimeError(
                 "Tensor names in engine are not the same as expected, to use this GenerationSession, "
                 "you need to use PretrainedModel.prepare_inputs to create TRT Network inputs."

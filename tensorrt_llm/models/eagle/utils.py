@@ -343,7 +343,7 @@ def _prepare_decoder_attention_mask(
     if input_shape[-1] > 1:
         combined_attention_mask = make_causal_mask(
             input_shape,
-            torch.float32,
+            torch.float16,
             device=inputs_embeds.device,
             past_key_values_length=past_key_values_length,
         )
@@ -494,13 +494,13 @@ def generate_candidates(tree_logits, tree_indices, retrieve_indices, sample_toke
     if logits_processor is not None:
         candidates_tree_prob = tree_logits[1]
         candidates_prob = torch.cat(
-            [torch.ones((bs, 1), device=candidates_tree_prob.device, dtype=torch.float32),
+            [torch.ones((bs, 1), device=candidates_tree_prob.device, dtype=torch.float16),
              candidates_tree_prob.view(bs, -1)],
             dim=-1)
 
         tree_candidates_prob = candidates_prob[:, tree_indices]
         tree_candidates_prob_ext = torch.cat(
-            [tree_candidates_prob, torch.ones((bs, 1), dtype=torch.float32, device=tree_candidates_prob.device)],
+            [tree_candidates_prob, torch.ones((bs, 1), dtype=torch.float16, device=tree_candidates_prob.device)],
             dim=-1)
         cart_candidates_prob = tree_candidates_prob_ext[:, retrieve_indices]
     else:

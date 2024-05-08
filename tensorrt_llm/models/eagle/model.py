@@ -29,6 +29,8 @@ from transformers.models.llama.modeling_llama import repeat_kv
 import math
 from ...mapping import Mapping
 import tensorrt as trt
+from collections import OrderedDict
+from ..generation_mixin import GenerationMixin
 
 class EAGLEConfig(PretrainedConfig):
     
@@ -386,7 +388,7 @@ class EAGLEModel(Module):
             combined_attention_mask = make_causal_mask(
                 input_shape[0],
                 input_shape[1],
-                dtype=trt.DataType.FLOAT,
+                dtype=trt.DataType.HALF,
                 past_key_values_length=past_key_values_length,
             )
 
@@ -404,7 +406,7 @@ class EAGLEModel(Module):
             bs=combined_attention_mask.size(0)
             combined_attention_mask[:, :, -tree_len:, -tree_len:][
                 tree_mask.repeat(bs,1,1,1) == 0
-                ] = torch.finfo(torch.float32).min
+                ] = torch.finfo(torch.float16).min
 
         return combined_attention_mask
 
@@ -441,11 +443,6 @@ class EAGLEModel(Module):
             position_ids = view(position_ids, (-1, seq_length))
 
         print("Position IDs: ", position_ids)
-        """
-        python3 ../run.py --max_output_len=50 \
-                  --tokenizer_dir /models/model_input/vicuna-7b-1.3 \
-                  --engine_dir=/models/model_output/eagle_model_engine
-        """
         # if attention_mask is None:
         #     attention_mask = Tensor("attention_mask",trt.DataType.INT32, (batch_size, seq_length_with_past))
 
@@ -653,11 +650,10 @@ class EagleForCausalLM(LLaMAForCausalLM):
         if self.mapping.is_last_pp_rank():
             
             eagle_logits: Tensor = self.ea_layer(hidden_states, **kwargs)
-            eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
+            # eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
-        print("Eagle Logits: ", eagle_logits, "Hidden States: ", hidden_states)
         if kwargs['use_cache'] and default_net(
         ).plugin_config.paged_kv_cache == False:
             if self.mapping.is_last_pp_rank():
@@ -672,14 +668,6 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 return eagle_logits
             return hidden_states
     
-if __name__ == "__main__":
-
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    text = "Hi how are you"
-    tokenizer = AutoTokenizer.from_pretrained("/models/model_input/vicuna-7b-v1.3")
-    model = EagleForCausalLM.from_checkpoint("/models/model_output/eagle_model")
-
-    input_id = tokenizer(text, return_tensors="pt")
-
-    print(model(**input_id))
+    def prepare_inputs(self, *args, **kwargs):
+        inputs = super().prepare_inputs(*args, **kwargs)
+        return inputs

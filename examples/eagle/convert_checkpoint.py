@@ -1034,7 +1034,8 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing
+        'share_embedding_table': args.use_embedding_sharing,
+        'use_eagle': True
     }
 
     if args.use_weight_only:
