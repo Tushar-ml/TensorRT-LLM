@@ -86,6 +86,11 @@ def parse_arguments():
         'per_channel instead uses a different static scaling factor for each channel. '
         'The latter is usually more accurate, but a little slower.')
     parser.add_argument(
+        '--max_eagle_token_len',
+        default = 63,
+        type=int
+    )
+    parser.add_argument(
         '--per_token',
         action="store_true",
         default=False,
@@ -1035,7 +1040,8 @@ if __name__ == '__main__':
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
-        'use_eagle': True
+        'use_eagle': True,
+        'max_draft_len': args.max_eagle_token_len
     }
 
     if args.use_weight_only:
@@ -1170,7 +1176,7 @@ if __name__ == '__main__':
                     split_v = split_qkv_tp(qkv_weight, args.n_head, args.n_embd,
                                         mapping.tp_size, mapping.tp_rank)
                     
-                    weights.update(get_tllm_linear_weight(split_v, "ea_layer.layers.0.self_attn.qkv.", None,args.use_weight_only,
+                    weights.update(get_tllm_linear_weight(split_v, "ea_layer.0.layers.0.self_attn.qkv.", None,args.use_weight_only,
                                                           plugin_weight_only_quant_type))
 
                     attn_dense_weight = get_weight(state_dict,
@@ -1180,7 +1186,7 @@ if __name__ == '__main__':
                                             mapping.tp_rank,
                                             dim=1)
                     weights.update(
-                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.self_attn.dense.",
+                        get_tllm_linear_weight(split_v, "ea_layer.0.layers.0.self_attn.dense.",
                                             None, args.use_weight_only,
                                             plugin_weight_only_quant_type))
                     mlp_gate_weight = get_weight(state_dict, prefix + 'mlp.up_proj',
@@ -1191,7 +1197,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.gate.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.0.layers.0.mlp.gate.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
 
@@ -1204,7 +1210,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.fc.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.0.layers.0.mlp.fc.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
                     
@@ -1217,7 +1223,7 @@ if __name__ == '__main__':
                                             dim=0)
                     
                     weights.update(
-                        get_tllm_linear_weight(split_v, "ea_layer.layers.0.mlp.proj.", None,
+                        get_tllm_linear_weight(split_v, "ea_layer.0.layers.0.mlp.proj.", None,
                                             args.use_weight_only,
                                             plugin_weight_only_quant_type))
                     
@@ -1234,7 +1240,7 @@ if __name__ == '__main__':
                             key = key.replace("post_attention_layernorm", "post_layernorm")
                             weights.update(
                                 get_tllm_linear_weight(split_v,
-                                                        f'ea_layer.{key.replace("weight","")}',
+                                                        f'ea_layer.0.{key.replace("weight","")}',
                                                         None, args.use_weight_only, plugin_weight_only_quant_type
                                                         )
                             )
@@ -1242,7 +1248,7 @@ if __name__ == '__main__':
                             b = state_dict[key].clone().to(
                                 torch_dtype)
 
-                            weights[f'ea_layer.{key}'] = split(b, mapping.tp_size,
+                            weights[f'ea_layer.0.{key}'] = split(b, mapping.tp_size,
                                                         mapping.tp_rank)
 
                     return weights

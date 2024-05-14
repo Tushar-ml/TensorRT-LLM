@@ -179,6 +179,13 @@ def parse_arguments(args=None):
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
+    parser.add_argument(
+        '--eagle_choices',
+        type=str,
+        default=None,
+        help="Eagle choice to use, if not none, will use Medusa decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
 
     return parser.parse_args(args=args)
 
@@ -395,12 +402,20 @@ def main(args):
                          rank=runtime_rank,
                          debug_mode=args.debug_mode,
                          lora_ckpt_source=args.lora_ckpt_source)
+    
+    if args.eagle_choices is not None:
+        args.eagle_choices = ast.literal_eval(args.eagle_choices)
+        assert args.use_py_session, "Eagle is only supported by py_session"
+        assert args.num_beams == 1, "Medusa should use num_beams == 1"
+        runner_kwargs.update(eagle_choices = args.eagle_choices)
+
     if args.medusa_choices is not None:
         args.medusa_choices = ast.literal_eval(args.medusa_choices)
         assert args.use_py_session, "Medusa is only supported by py_session"
         assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
         assert args.num_beams == 1, "Medusa should use num_beams == 1"
         runner_kwargs.update(medusa_choices=args.medusa_choices)
+
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
@@ -439,7 +454,9 @@ def main(args):
             streaming=args.streaming,
             output_sequence_lengths=True,
             return_dict=True,
-            medusa_choices=args.medusa_choices)
+            medusa_choices=args.medusa_choices,
+            eagle_choices=args.eagle_choices)
+        
         torch.cuda.synchronize()
 
     if args.streaming:

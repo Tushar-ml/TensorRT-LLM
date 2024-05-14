@@ -17,7 +17,7 @@ from ...models.llama.model import LLaMAForCausalLM
 from .utils import *
 from .layers import *
 from transformers.configuration_utils import PretrainedConfig
-from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul, unsqueeze, view, shape
+from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul,stack, unsqueeze, view, shape, select, split, argmax
 from ...layers import ColumnLinear, Attention, AttentionMaskType
 from ...layers.attention import make_causal_mask
 from ...layers.normalization import RmsNorm
@@ -27,11 +27,13 @@ from typing import Optional, Tuple, List
 from ..._common import default_net
 from transformers.models.llama.modeling_llama import repeat_kv
 import math
+from ..._utils import pad_vocab_size
 from ...mapping import Mapping
 import tensorrt as trt
 from collections import OrderedDict
 from ..generation_mixin import GenerationMixin
 
+mc_sim_7b_63 = [[0],[1],[2],[3],[0,0],[0,1],[0,2],[1,0],[1,1],[2,0],[2,1],[3,0],[0,0,0],[0,0,1],[0,0,2],[0,1,0],[0,1,1],[0,2,0],[0,2,1],[1,0,0],[0,0,0,0],[0,0,0,1],[0,0,0,2],[0,0,0,0,0],[0,0,0,0,1]]
 class EAGLEConfig(PretrainedConfig):
     
     model_type = "llama"
@@ -283,7 +285,7 @@ class EAGLEMLP(Module):
 
 
         return down_proj
-      
+     
 class EAGLEDecoderLayer(Module):
 
     def __init__(self,index,
@@ -314,7 +316,8 @@ class EAGLEDecoderLayer(Module):
                     position_ids: Optional[torch.LongTensor] = None,
                     past_key_value: Optional[Tuple[Tensor]] = None,
                     use_cache: Optional[bool] = False,
-                    attention_params: Optional[Tensor] = None, kv_cache_params = None, **kwargs
+                    attention_params: Optional[Tensor] = None, kv_cache_params = None,
+                    **kwargs
             ):
 
         residual = hidden_states
@@ -361,6 +364,8 @@ class EAGLEModel(Module):
         self.gradient_checkpointing = False
         self.vocab_size = vocab_size
         self.embed_tokens = Embedding(vocab_size, hidden_size)
+        for param in self.embed_tokens.parameter():
+            param.requires_grad = False
 
         self.layers = ModuleList([
             EAGLEDecoderLayer(index,hidden_size, num_kv_heads, num_attention_heads,
@@ -374,11 +379,6 @@ class EAGLEModel(Module):
         
         self.act = ACT2FN[hidden_act]
 
-    def init_tree(self):
-        self.tree_buffer = generate_tree_buffers_for_eagle(self.tree, "cuda")
-    
-    def reset(self):
-        self.tree_mask = None
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
@@ -427,14 +427,12 @@ class EAGLEModel(Module):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        with torch.no_grad():
-            inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = self.embed_tokens(input_ids)
 
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = "cpu"
             position_ids:Tensor = arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype="int64"
             )
@@ -442,19 +440,11 @@ class EAGLEModel(Module):
         else:
             position_ids = view(position_ids, (-1, seq_length))
 
-        print("Position IDs: ", position_ids)
-        # if attention_mask is None:
-        #     attention_mask = Tensor("attention_mask",trt.DataType.INT32, (batch_size, seq_length_with_past))
-
-        print("Attention Mask: ", attention_mask)
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (shape(hidden_states,0), shape(hidden_states,1)), hidden_states, past_key_values_length
         )
 
-        print("Attention Mask: ", attention_mask)
-
-        inputs_embeds = inputs_embeds
-        hidden_states = self.fc(concat((inputs_embeds, hidden_states), dim=-1))
+        hidden_states = self.fc(concat((inputs_embeds, hidden_states), dim=0))
 
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
@@ -478,8 +468,9 @@ class EAGLEModel(Module):
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+        
+        return hidden_states, next_decoder_cache
 
-        return hidden_states
 
     def reset_kv(self):
         self.stable_kv = None
@@ -491,122 +482,7 @@ class EAGLEModel(Module):
             new_hidden.append(hidden_state[:, id:id + 1].repeat(1, i, 1))
         return concat(new_hidden, dim=1)
 
-    def sample(self, logits, logits_processor, k=1):
-        bs, seq_len, _ = logits.shape
-        logits = logits.view(-1, logits.shape[-1])
-        logits = logits_processor(None, logits)
-        probabilities = softmax(logits, dim=-1)
-        sampled_indices = torch.multinomial(probabilities, k, replacement=False)
-        sampled_probs = torch.gather(probabilities, -1, sampled_indices)
-        cumulative_sum = torch.cumsum(sampled_probs, dim=-1)
-        cumulative_sum = concat(
-            (torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device), cumulative_sum[:, :-1]), dim=-1)
-        sampled_probs = sampled_probs / (1 - cumulative_sum)
-        sampled_probs[torch.isinf(sampled_probs)] = -1
-        sampled_probs[torch.isnan(sampled_probs)] = -1
-        sampled_probs = torch.clamp(sampled_probs, min=0.0, max=1.0)
-        sampled_indices = sampled_indices.view(bs, seq_len, -1)
-        sampled_probs = sampled_probs.view(bs, seq_len, -1)
-        probabilities = probabilities.view(bs, seq_len, -1)
 
-        return sampled_indices, sampled_probs, probabilities
-
-    @torch.no_grad()
-    def topK_generate(self, hidden_states, input_ids, head, logits_processor, max_length=4, use_cache=True,
-                     attention_mask=None, len_posi=None, ):
-        top_k = 5
-        bs = input_ids.shape[0]
-        input_ids = input_ids[:, 1:]
-        input_ids = input_ids.to(hidden_states.device)
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        position_ids = position_ids.to(self.device)
-        zero_num = position_ids.shape[1] - position_ids.max(dim=-1).values - 1
-        zero_num = zero_num[:, None]
-        ss_token, ss_prob, ss_op = [], [], []
-        if len_posi is None:
-            len_posi = input_ids.shape[1]
-        self.reset()
-        if use_cache:
-
-            if hasattr(self, "stable_kv") and self.stable_kv is not None:
-                kv_len = self.stable_kv[0][0].shape[2]
-                position_ids = position_ids[:, kv_len:]
-                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv,
-                                                   use_cache=True, attention_mask=attention_mask,
-                                                   position_ids=position_ids)
-
-
-            else:
-                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True,
-                                                   attention_mask=attention_mask, position_ids=position_ids)
-            self.stable_kv = past_key_values
-            last_nopadding = position_ids.argmax(dim=-1)
-            ab = tuple(range(bs))
-            last_hidden = out_hidden[ab, last_nopadding][:, None]
-            if not self.diff_device:
-                last_headout = head(last_hidden)
-            else:
-                if hasattr(self, "layer_device"):
-                    last_headout = head(last_hidden)
-                    last_headout = last_headout.to(self.layer_device)
-                else:
-                    last_headout = ColumnLinear(last_hidden, self.headweight)
-            
-            for i in range(len(self.tree_buffer['tree_indices'])):
-                if logits_processor is not None:
-                    topk_index, topk_prob, op = self.sample(last_headout, logits_processor, k=top_k, )
-                else:
-                    topk_index, topk_prob = torch.topk(last_headout, top_k, dim=-1).indices, torch.topk(last_headout,
-                                                                                                        top_k,
-                                                                                                        dim=-1).values
-                    op = None
-
-                ss_token.append(topk_index)
-                ss_prob.append(topk_prob)
-                ss_op.append(op)
-
-                input_ids = topk_index.view(bs, -1)[:, self.tree_buffer['tree_indices'][i]]
-
-                attention_mask = concat((attention_mask, torch.ones_like(input_ids, device=attention_mask.device,
-                                                                            dtype=attention_mask.dtype)), dim=1)
-
-                if i == 0:
-                    hidden_states = last_hidden
-                else:
-                    hidden_states = out_hidden
-                hidden_states = self.repeat_hidden(hidden_states, self.tree_buffer["repeat_nums"][i])
-                self.tree_mask = self.tree_buffer['attn_mask'][i]
-                position_ids = len_posi + self.tree_buffer["position_ids"][i][None, :] - zero_num
-                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, past_key_values=past_key_values,
-                                                   position_ids=position_ids, use_cache=True,
-                                                   attention_mask=attention_mask)
-                len_posi += 1
-
-                if not self.diff_device:
-                    last_headout = head(out_hidden)
-                else:
-                    if hasattr(self, "layer_device"):
-                        last_headout = head(out_hidden)
-                        last_headout = last_headout.to(self.layer_device)
-                    else:
-                        last_headout = ColumnLinear(out_hidden[0], self.headweight)
-
-            if logits_processor is not None:
-                topk_index, topk_prob, op = self.sample(last_headout, logits_processor, k=top_k, )
-            else:
-                topk_index, topk_prob = torch.topk(last_headout, top_k, dim=-1).indices, torch.topk(last_headout, top_k,
-                                                                                                    dim=-1).values
-                op = None
-            ss_token.append(topk_index)
-            ss_prob.append(topk_prob)
-            ss_op.append(op)
-
-        else:
-            # TODO
-            pass
-
-        return (concat(ss_token, dim=1), concat(ss_prob, dim=1), ss_op)
 
 
 class EagleForCausalLM(LLaMAForCausalLM):
@@ -616,19 +492,20 @@ class EagleForCausalLM(LLaMAForCausalLM):
         super().__init__(config)
 
         bias = False
-        self.ea_layer = EAGLEModel(config.vocab_size, config.hidden_size,
+        self.num_eagle_heads = 1
+        vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                           config.mapping.tp_size)
+        self.ea_layer = ModuleList([EAGLEModel(vocab_size_padded, config.hidden_size,
                                    config.num_hidden_layers, config.hidden_act,
                                    config.num_key_value_heads, config.num_attention_heads,
                                    config.max_position_embeddings, config.rope_scaling, config.rms_norm_eps, config.intermediate_size,
-                                   config.pretraining_tp)
+                                   config.pretraining_tp) for _ in range(self.num_eagle_heads) ])
         device = "cuda"
 
         self.ea_layer.device = device
         self.ea_layer.diff_device = False
         self.ea_layer.tree = tree_structure
         self.tree = tree_structure
-
-        self.ea_layer.init_tree()
         self.lm_head = ColumnLinear(config.hidden_size,
                                     config.vocab_size,
                                     bias=False,
@@ -636,38 +513,85 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                     tp_group=mapping.tp_group,
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
-        
+        self.max_eagle_token_len = config.max_draft_len
+    
     def forward(self, *args, **kwargs):
         output_original = True
         hidden_states = super().forward(*args, **kwargs)
-        print(args, kwargs)
+        
         if kwargs['use_cache']:
             if default_net().plugin_config.paged_kv_cache:
                 lm_logits, hidden_states = hidden_states
             else:
                 lm_logits, presents, hidden_states = hidden_states
 
+        token = argmax(unsqueeze(select(lm_logits, 1, lm_logits.shape[1]-1),0),-1)
+        input_ids = concat([kwargs['input_ids'], token], dim=0)
+        kwargs["input_ids"] = input_ids
+
         if self.mapping.is_last_pp_rank():
+            eagle_logits = []
+            for i in range(self.num_eagle_heads):
+                eagle_logits.append(self.lm_head(self.ea_layer[i](hidden_states, **kwargs)[0]))
             
-            eagle_logits: Tensor = self.ea_layer(hidden_states, **kwargs)
-            # eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
+            eagle_logits = stack(eagle_logits, dim=0)
+            print("Eagle Logits: ", eagle_logits)            
+            eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
-        if kwargs['use_cache'] and default_net(
-        ).plugin_config.paged_kv_cache == False:
-            if self.mapping.is_last_pp_rank():
-                if output_original:
-                    return (eagle_logits, lm_logits, presents)
-                return (eagle_logits, presents)
-            return (hidden_states, presents)
-        else:
-            if self.mapping.is_last_pp_rank():
-                if output_original:
-                    return eagle_logits, lm_logits
-                return eagle_logits
-            return hidden_states
+        return eagle_logits, lm_logits
     
+    # def prepare_inputs(self, *args, **kwargs):
+    #     inputs = super().prepare_inputs(*args, **kwargs)
+    #     return inputs
+
     def prepare_inputs(self, *args, **kwargs):
+        kwargs['max_draft_len'] = self.max_eagle_token_len
         inputs = super().prepare_inputs(*args, **kwargs)
+        num_profiles = len(inputs['input_ids'].profiles)
+        max_gen_token_len = self.max_eagle_token_len + 1
+        medusa_mask_len_range = [[0, max_gen_token_len, max_gen_token_len]
+                                 ] * num_profiles
+        medusa_position_len_range = [[0, max_gen_token_len, max_gen_token_len]
+                                     ] * num_profiles
+        # # 32 bits packed mask aligned.
+        num_packed_medusa_masks = (self.max_eagle_token_len + 1 + 32 - 1) // 32
+        packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
+                                        ] * num_profiles
+
+        # batch beam range (different sequence may have different medusa offsets or packed masks).
+        bb_range_cxt = GenerationMixin.default_range(kwargs['max_batch_size'])
+        bb_range_gen = GenerationMixin.default_range(kwargs['max_batch_size'] *
+                                                     kwargs['max_beam_width'])
+        # enable_two_optimization_profiles
+        if num_profiles == 2:
+            bb_range = [bb_range_cxt, bb_range_gen]
+        else:
+            bb_range = [bb_range_gen]
+
+        # medusa position offsets that are fixed during the whole session.
+        # it will be shared among all sequences.
+        medusa_position_offsets = Tensor(
+            name='medusa_position_offsets',
+            dtype=trt.int32,
+            shape=[-1, -1],
+            dim_range=OrderedDict([
+                ('batch_size_beam_width', bb_range),
+                ('medusa_position_ids_dim0', medusa_position_len_range),
+            ]),
+        )
+
+        medusa_packed_mask = Tensor(
+            name='medusa_packed_mask',
+            dtype=trt.int32,
+            shape=[-1, -1, -1],
+            dim_range=OrderedDict([
+                ('batch_size_beam_width', bb_range),
+                ('medusa_packed_mask_dim0', medusa_mask_len_range),
+                ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
+            ]),
+        )
+        inputs['medusa_packed_mask'] = medusa_packed_mask
+        inputs['medusa_position_offsets'] = medusa_position_offsets
         return inputs

@@ -140,6 +140,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     lora_plugin = plugin_config.get('lora_plugin')
     use_context_fmha_for_generation = plugin_config.get(
         'use_context_fmha_for_generation')
+    use_eagle = plugin_config.get("use_eagle", False)
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
@@ -172,6 +173,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        use_eagle=use_eagle
     )
 
     other_config = {
@@ -423,6 +425,7 @@ class ModelRunner(ModelRunnerMixin):
                     debug_mode: bool = False,
                     lora_ckpt_source: str = "hf",
                     medusa_choices: List[List[int]] = None,
+                    eagle_choices: List[List[int]] = None,
                     stream: torch.cuda.Stream = None) -> 'ModelRunner':
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
@@ -484,6 +487,8 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'layer_types') else [],
             rnn_hidden_size=pretrained_config.rnn_hidden_size if hasattr(
                 pretrained_config, 'rnn_hidden_size') else 0,
+            use_eagle=pretrained_config.use_eagle if hasattr(
+                pretrained_config, "use_eagle") else False
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
@@ -538,6 +543,7 @@ class ModelRunner(ModelRunnerMixin):
                  debug_mode: bool = False,
                  lora_ckpt_source: str = "hf",
                  medusa_choices: List[List[int]] = None,
+                 eagle_choices: List[List[int]] = None,
                  stream: torch.cuda.Stream = None) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -636,7 +642,7 @@ class ModelRunner(ModelRunnerMixin):
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
             runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
-                                             lora_ckpt_source, medusa_choices,
+                                             lora_ckpt_source, medusa_choices,eagle_choices,
                                              stream)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
@@ -706,6 +712,7 @@ class ModelRunner(ModelRunnerMixin):
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
                  medusa_choices: Optional[List[List[int]]] = None,
+                 eagle_choices: Optional[List[List[int]]] = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -765,7 +772,8 @@ class ModelRunner(ModelRunnerMixin):
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
-            medusa_choices=medusa_choices)
+            medusa_choices=medusa_choices,
+            eagle_choices=eagle_choices)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
