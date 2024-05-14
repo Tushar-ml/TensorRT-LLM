@@ -469,7 +469,7 @@ class EAGLEModel(Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
         
-        return hidden_states, next_decoder_cache
+        return hidden_states
 
 
     def reset_kv(self):
@@ -495,11 +495,11 @@ class EagleForCausalLM(LLaMAForCausalLM):
         self.num_eagle_heads = 1
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
-        self.ea_layer = ModuleList([EAGLEModel(vocab_size_padded, config.hidden_size,
+        self.ea_layer = EAGLEModel(vocab_size_padded, config.hidden_size,
                                    config.num_hidden_layers, config.hidden_act,
                                    config.num_key_value_heads, config.num_attention_heads,
                                    config.max_position_embeddings, config.rope_scaling, config.rms_norm_eps, config.intermediate_size,
-                                   config.pretraining_tp) for _ in range(self.num_eagle_heads) ])
+                                   config.pretraining_tp)
         device = "cuda"
 
         self.ea_layer.device = device
@@ -530,68 +530,75 @@ class EagleForCausalLM(LLaMAForCausalLM):
         kwargs["input_ids"] = input_ids
 
         if self.mapping.is_last_pp_rank():
-            eagle_logits = []
-            for i in range(self.num_eagle_heads):
-                eagle_logits.append(self.lm_head(self.ea_layer[i](hidden_states, **kwargs)[0]))
-            
-            eagle_logits = stack(eagle_logits, dim=0)
-            print("Eagle Logits: ", eagle_logits)            
+            eagle_logits = self.lm_head(self.ea_layer(hidden_states, **kwargs))
             eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
-        return eagle_logits, lm_logits
-    
-    # def prepare_inputs(self, *args, **kwargs):
-    #     inputs = super().prepare_inputs(*args, **kwargs)
-    #     return inputs
-
-    def prepare_inputs(self, *args, **kwargs):
-        kwargs['max_draft_len'] = self.max_eagle_token_len
-        inputs = super().prepare_inputs(*args, **kwargs)
-        num_profiles = len(inputs['input_ids'].profiles)
-        max_gen_token_len = self.max_eagle_token_len + 1
-        medusa_mask_len_range = [[0, max_gen_token_len, max_gen_token_len]
-                                 ] * num_profiles
-        medusa_position_len_range = [[0, max_gen_token_len, max_gen_token_len]
-                                     ] * num_profiles
-        # # 32 bits packed mask aligned.
-        num_packed_medusa_masks = (self.max_eagle_token_len + 1 + 32 - 1) // 32
-        packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
-                                        ] * num_profiles
-
-        # batch beam range (different sequence may have different medusa offsets or packed masks).
-        bb_range_cxt = GenerationMixin.default_range(kwargs['max_batch_size'])
-        bb_range_gen = GenerationMixin.default_range(kwargs['max_batch_size'] *
-                                                     kwargs['max_beam_width'])
-        # enable_two_optimization_profiles
-        if num_profiles == 2:
-            bb_range = [bb_range_cxt, bb_range_gen]
+        if kwargs['use_cache'] and default_net(
+        ).plugin_config.paged_kv_cache == False:
+            if self.mapping.is_last_pp_rank():
+                if output_original:
+                    return (eagle_logits, lm_logits, presents)
+                return (eagle_logits, presents)
+            return (hidden_states, presents)
         else:
-            bb_range = [bb_range_gen]
-
-        # medusa position offsets that are fixed during the whole session.
-        # it will be shared among all sequences.
-        medusa_position_offsets = Tensor(
-            name='medusa_position_offsets',
-            dtype=trt.int32,
-            shape=[-1, -1],
-            dim_range=OrderedDict([
-                ('batch_size_beam_width', bb_range),
-                ('medusa_position_ids_dim0', medusa_position_len_range),
-            ]),
-        )
-
-        medusa_packed_mask = Tensor(
-            name='medusa_packed_mask',
-            dtype=trt.int32,
-            shape=[-1, -1, -1],
-            dim_range=OrderedDict([
-                ('batch_size_beam_width', bb_range),
-                ('medusa_packed_mask_dim0', medusa_mask_len_range),
-                ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
-            ]),
-        )
-        inputs['medusa_packed_mask'] = medusa_packed_mask
-        inputs['medusa_position_offsets'] = medusa_position_offsets
+            if self.mapping.is_last_pp_rank():
+                if output_original:
+                    return eagle_logits, lm_logits
+                return eagle_logits
+            return hidden_states
+    
+    def prepare_inputs(self, *args, **kwargs):
+        inputs = super().prepare_inputs(*args, **kwargs)
         return inputs
+
+    # def prepare_inputs(self, *args, **kwargs):
+    #     kwargs['max_draft_len'] = self.max_eagle_token_len
+    #     inputs = super().prepare_inputs(*args, **kwargs)
+    #     num_profiles = len(inputs['input_ids'].profiles)
+    #     max_gen_token_len = self.max_eagle_token_len + 1
+    #     medusa_mask_len_range = [[0, max_gen_token_len, max_gen_token_len]
+    #                              ] * num_profiles
+    #     medusa_position_len_range = [[0, max_gen_token_len, max_gen_token_len]
+    #                                  ] * num_profiles
+    #     # # 32 bits packed mask aligned.
+    #     num_packed_medusa_masks = (self.max_eagle_token_len + 1 + 32 - 1) // 32
+    #     packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
+    #                                     ] * num_profiles
+
+    #     # batch beam range (different sequence may have different medusa offsets or packed masks).
+    #     bb_range_cxt = GenerationMixin.default_range(kwargs['max_batch_size'])
+    #     bb_range_gen = GenerationMixin.default_range(kwargs['max_batch_size'] *
+    #                                                  kwargs['max_beam_width'])
+    #     # enable_two_optimization_profiles
+    #     if num_profiles == 2:
+    #         bb_range = [bb_range_cxt, bb_range_gen]
+    #     else:
+    #         bb_range = [bb_range_gen]
+
+    #     # medusa position offsets that are fixed during the whole session.
+    #     # it will be shared among all sequences.
+    #     medusa_position_offsets = Tensor(
+    #         name='medusa_position_offsets',
+    #         dtype=trt.int32,
+    #         shape=[-1, -1],
+    #         dim_range=OrderedDict([
+    #             ('batch_size_beam_width', bb_range),
+    #             ('medusa_position_ids_dim0', medusa_position_len_range),
+    #         ]),
+    #     )
+
+    #     medusa_packed_mask = Tensor(
+    #         name='medusa_packed_mask',
+    #         dtype=trt.int32,
+    #         shape=[-1, -1, -1],
+    #         dim_range=OrderedDict([
+    #             ('batch_size_beam_width', bb_range),
+    #             ('medusa_packed_mask_dim0', medusa_mask_len_range),
+    #             ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
+    #         ]),
+    #     )
+    #     inputs['medusa_packed_mask'] = medusa_packed_mask
+    #     inputs['medusa_position_offsets'] = medusa_position_offsets
+    #     return inputs

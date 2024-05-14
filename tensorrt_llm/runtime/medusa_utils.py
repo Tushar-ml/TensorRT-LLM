@@ -176,3 +176,7 @@ def _medusa_setup(choices_or_paths, num_medusa_heads=None):
         medusa_tree_ids=medusa_tree_ids.cuda(),
         medusa_position_offsets=medusa_position_offsets.cuda(),
     )
+
+print(_medusa_setup([[0],[1],[2],[3],[0,0],[0,1],[0,2],[1,0],[1,1],[2,0],[2,1],[3,0]
+                ,[0,0,0],[0,0,1],[0,0,2],[0,1,0],[0,1,1],[0,2,0],[0,2,1],[1,0,0],
+                [0,0,0,0],[0,0,0,1],[0,0,0,2],[0,0,0,0,0],[0,0,0,0,1]]))

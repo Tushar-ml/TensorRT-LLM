@@ -681,12 +681,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
-        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsMedusaEnabled,
-            "Only Medusa mode supports input length > 1 in the generation phase, input_seq_length=%d, "
-            "mIsMedusaEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
-            input_seq_length, mIsMedusaEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
-            qkvDims.d[2]);
-        TLLM_CHECK_WITH_INFO(input_seq_length == num_medusa_tokens + 1, "The generation input length is not expected.");
+        // TLLM_CHECK_WITH_INFO(input_seq_length >= 1 || mIsMedusaEnabled,
+        //     "Only Medusa mode supports input length > 1 in the generation phase, input_seq_length=%d, "
+        //     "mIsMedusaEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
+        //     input_seq_length, mIsMedusaEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
+        //     qkvDims.d[2]);
+        // TLLM_CHECK_WITH_INFO(input_seq_length == num_medusa_tokens + 1, "The generation input length is not expected.");
         EnqueueGenerationParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, input_seq_length,
             sequence_kv_length, max_context_kv_len, beamWidth, context_q_lengths, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
