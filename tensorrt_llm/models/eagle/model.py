@@ -17,7 +17,7 @@ from ...models.llama.model import LLaMAForCausalLM
 from .utils import *
 from .layers import *
 from transformers.configuration_utils import PretrainedConfig
-from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul,stack, unsqueeze, view, shape, select, split, argmax
+from ...functional import ACT2FN, Tensor, softmax, expand_mask, matmul,stack, topk, unsqueeze, view, shape, select, split, argmax
 from ...layers import ColumnLinear, Attention, AttentionMaskType
 from ...layers.attention import make_causal_mask
 from ...layers.normalization import RmsNorm
@@ -378,7 +378,7 @@ class EAGLEModel(Module):
                                     bias=bias)
         
         self.act = ACT2FN[hidden_act]
-
+        
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
@@ -505,7 +505,6 @@ class EagleForCausalLM(LLaMAForCausalLM):
         self.ea_layer.device = device
         self.ea_layer.diff_device = False
         self.ea_layer.tree = tree_structure
-        self.tree = tree_structure
         self.lm_head = ColumnLinear(config.hidden_size,
                                     config.vocab_size,
                                     bias=False,
@@ -514,9 +513,24 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                     tp_size=mapping.tp_size,
                                     gather_output=True)
         self.max_eagle_token_len = config.max_draft_len
-    
+        self.tree = mc_sim_7b_63
+        self.tree_buffer = generate_tree_buffers_for_eagle(self.tree)
+
+    def repeat_hidden(self, hidden_state: Tensor, repeat_num: list):
+        new_hidden = []
+        for idx, i in enumerate(repeat_num):
+            nh = unsqueeze(select(hidden_state,0,idx),0)
+            for _ in range(i):
+                new_hidden.append(nh)
+        
+        new_hidden = concat(new_hidden, dim=0)
+        return new_hidden
+
+
+
     def forward(self, *args, **kwargs):
         output_original = True
+        TOP_K = 10
         hidden_states = super().forward(*args, **kwargs)
         
         if kwargs['use_cache']:
@@ -525,13 +539,45 @@ class EagleForCausalLM(LLaMAForCausalLM):
             else:
                 lm_logits, presents, hidden_states = hidden_states
 
-        token = argmax(unsqueeze(select(lm_logits, 1, lm_logits.shape[1]-1),0),-1)
-        input_ids = concat([kwargs['input_ids'], token], dim=0)
-        kwargs["input_ids"] = input_ids
-
+        # token = argmax(unsqueeze(select(lm_logits, 1, lm_logits.shape[1]-1),0),-1, True)
+        # print("Token: ", token)
+        # input_ids = concat([kwargs['input_ids'], select(token,1,0)], dim=0)
+        # kwargs["input_ids"] = input_ids
+        # token.mark_output("eagle_input_ids")
+        
         if self.mapping.is_last_pp_rank():
             eagle_logits = self.lm_head(self.ea_layer(hidden_states, **kwargs))
             eagle_logits.mark_output('eagle_logits', self.config.logits_dtype)
+
+            # prob, index = topk(eagle_logits, TOP_K, 1)
+            # index = view(index, [-1])
+            # ss_index = []
+
+            # if index.shape[0] > 0:
+            #     for idx, tree_ind in enumerate(self.tree_buffer["tree_indices"]):
+            #         ind_list = []
+                    
+            #         prob, index = topk(eagle_logits, TOP_K, 1)
+            #         index = view(index, [-1])
+            #         ss_index.append(unsqueeze(index,0))
+
+            #         for ind in tree_ind:
+            #             input_ids = select(index, 1, ind)
+            #             ind_list.append(input_ids)
+            #         input_ids = stack(ind_list, dim=0)
+            #         kwargs['input_ids'] = input_ids
+
+            #         hidden_st = self.repeat_hidden(eagle_logits, self.tree_buffer["repeat_nums"][idx])
+
+            #         eagle_logits = self.lm_head(self.ea_layer(hidden_st, **kwargs))
+            
+            # prob, index = topk(eagle_logits, TOP_K, 1)
+            # index = unsqueeze(view(index, [-1]),0)
+            # ss_index.append(index)
+
+            # eagle_logits = concat(ss_index)
+            print("SS Index: ", eagle_logits)
+            
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
 
@@ -553,52 +599,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
         inputs = super().prepare_inputs(*args, **kwargs)
         return inputs
 
-    # def prepare_inputs(self, *args, **kwargs):
-    #     kwargs['max_draft_len'] = self.max_eagle_token_len
-    #     inputs = super().prepare_inputs(*args, **kwargs)
-    #     num_profiles = len(inputs['input_ids'].profiles)
-    #     max_gen_token_len = self.max_eagle_token_len + 1
-    #     medusa_mask_len_range = [[0, max_gen_token_len, max_gen_token_len]
-    #                              ] * num_profiles
-    #     medusa_position_len_range = [[0, max_gen_token_len, max_gen_token_len]
-    #                                  ] * num_profiles
-    #     # # 32 bits packed mask aligned.
-    #     num_packed_medusa_masks = (self.max_eagle_token_len + 1 + 32 - 1) // 32
-    #     packed_medusa_mask_len_range = [[0, 1, num_packed_medusa_masks]
-    #                                     ] * num_profiles
+if __name__ == "__main__":
 
-    #     # batch beam range (different sequence may have different medusa offsets or packed masks).
-    #     bb_range_cxt = GenerationMixin.default_range(kwargs['max_batch_size'])
-    #     bb_range_gen = GenerationMixin.default_range(kwargs['max_batch_size'] *
-    #                                                  kwargs['max_beam_width'])
-    #     # enable_two_optimization_profiles
-    #     if num_profiles == 2:
-    #         bb_range = [bb_range_cxt, bb_range_gen]
-    #     else:
-    #         bb_range = [bb_range_gen]
-
-    #     # medusa position offsets that are fixed during the whole session.
-    #     # it will be shared among all sequences.
-    #     medusa_position_offsets = Tensor(
-    #         name='medusa_position_offsets',
-    #         dtype=trt.int32,
-    #         shape=[-1, -1],
-    #         dim_range=OrderedDict([
-    #             ('batch_size_beam_width', bb_range),
-    #             ('medusa_position_ids_dim0', medusa_position_len_range),
-    #         ]),
-    #     )
-
-    #     medusa_packed_mask = Tensor(
-    #         name='medusa_packed_mask',
-    #         dtype=trt.int32,
-    #         shape=[-1, -1, -1],
-    #         dim_range=OrderedDict([
-    #             ('batch_size_beam_width', bb_range),
-    #             ('medusa_packed_mask_dim0', medusa_mask_len_range),
-    #             ('medusa_packed_mask_dim1', packed_medusa_mask_len_range),
-    #         ]),
-    #     )
-    #     inputs['medusa_packed_mask'] = medusa_packed_mask
-    #     inputs['medusa_position_offsets'] = medusa_position_offsets
-    #     return inputs
+    model = EagleForCausalLM.from_checkpoint("/models/model_output/eagle_output")
+    print(model)

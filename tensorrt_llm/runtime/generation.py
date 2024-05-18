@@ -779,7 +779,7 @@ class GenerationSession(object):
         print("Using Eagle: ", self.use_eagle)
 
         if self.use_eagle:
-            expected_tensor_names += ["eagle_logits"]
+            expected_tensor_names += ["eagle_logits", "eagle_input_ids"]
 
         if model_config.num_medusa_heads > 0:
             expected_tensor_names += [
@@ -1202,10 +1202,6 @@ class GenerationSession(object):
             self.accept_lengths = torch.ones([batch_size],
                                              dtype=torch.int32,
                                              device=self.device)
-            self.eagle_output_logits = torch.empty(
-                    [batch_size,self.num_eagle_heads, self.vocab_size_padded], # TODO: Need to check this
-                    dtype=self._tensor_dtype('logits'),
-                    device=self.device)
                 
         if self.is_medusa_mode:
             self.new_tokens = torch.zeros(
@@ -1313,15 +1309,16 @@ class GenerationSession(object):
         return dtype
     
     def _init_eagle(self, eagle_choices: List[List[int]]):
+        
         from tensorrt_llm.runtime.eagle_utils import _eagle_setup
         self.num_eagle_tokens = len(eagle_choices)
-        assert self.num_eagle_tokens > 0 and self.num_eagle_tokens <= self.max_eagle_tokens
         eagle_info = _eagle_setup(eagle_choices)
+        print("Eagle Info:", eagle_info)
         self.eagle_topks = eagle_info.eagle_topks
         self.eagle_paths = eagle_info.eagle_paths
+        print("Initial Eagle Paths: ", self.eagle_paths)
         self.eagle_tree_ids = eagle_info.eagle_tree_ids
-        self.num_eagle_heads = eagle_info.num_eagle_heads
-        
+
         return
 
 
@@ -1391,7 +1388,7 @@ class GenerationSession(object):
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
         self.max_seq_length = max_context_length + max_new_tokens
-        if medusa_choices is not None or eagle_choices is not None:
+        if medusa_choices is not None:
             self.max_seq_length += self._model_config.max_medusa_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
@@ -1488,20 +1485,21 @@ class GenerationSession(object):
                     (batch_size, self.num_eagle_tokens + 1,
                      self.vocab_size_padded)
                     if not self.gather_context_logits else
-                    (batch_size,max_context_length, self.vocab_size_padded),
+                    (batch_size, max_context_length, self.vocab_size_padded),
                     dtype=self._tensor_dtype('logits'),
                     device=self.device)
-                eagle_logits_shape = (self.num_eagle_heads, batch_size, self.num_eagle_tokens + 1,
-                                       self.vocab_size_padded)
-                if self.remove_input_padding:
-                    eagle_logits_shape = ( self.num_eagle_heads, batch_size * (self.num_eagle_tokens + 1) ,
-                                           self.vocab_size_padded)
+                eagle_logits_shape = (batch_size, self.eagle_topks + 1, self.eagle_topks)
 
                 self.buffer['eagle_logits'] = torch.empty(
                     eagle_logits_shape if not self.gather_context_logits else
-                    (self.num_eagle_heads, batch_size,max_context_length,
+                    (batch_size,max_context_length,
                      self.vocab_size_padded),
                     dtype=self._tensor_dtype('eagle_logits'),
+                    device=self.device)
+                
+                self.buffer['eagle_input_ids'] = torch.empty(
+                    (batch_size,1, max_context_length+10),
+                    dtype=self._tensor_dtype('eagle_input_ids'),
                     device=self.device)
 
             else:
@@ -1792,6 +1790,7 @@ class GenerationSession(object):
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
             if self.is_eagle_model:
                 add_tensor(self.buffer["eagle_logits"], "eagle_logits")
+                add_tensor(self.buffer['eagle_input_ids'], "eagle_input_ids")
 
             if not self.gather_context_logits or self.has_rnn_layers:
                 add_tensor(last_token_ids, 'last_token_ids')
@@ -2040,6 +2039,8 @@ class GenerationSession(object):
                 add_tensor(self.buffer['medusa_logits'], 'medusa_logits')
             if self.is_eagle_model:
                 add_tensor(self.buffer["eagle_logits"], "eagle_logits")
+                add_tensor(self.buffer["eagle_input_ids"], "eagle_input_ids")
+
             if not self.gather_context_logits or self.has_rnn_layers:
                 add_tensor(last_token_ids, 'last_token_ids')
         else:
@@ -2477,6 +2478,23 @@ class GenerationSession(object):
                 next_logits, dim=-1
             )  # TODO: can be done by treating [bs, nT, vocab] as [bs*nT, vocab] and using decoderOp?
             new_tokens = torch.cat((new_tokens_raw, zero_pad), dim=-1)
+
+            self.eagle_paths = torch.tensor([[ 0,  1,  5, 13, 21, 24],
+                                [ 0,  1,  5, 13, 21, 25],
+                                [ 0,  1,  5, 13, 22, -1],
+                                [ 0,  1,  5, 13, 23, -1],
+                                [ 0,  1,  5, 14, -1, -1],
+                                [ 0,  1,  5, 15, -1, -1],
+                                [ 0,  1,  6, 16, -1, -1],
+                                [ 0,  1,  6, 17, -1, -1],
+                                [ 0,  1,  7, 18, -1, -1],
+                                [ 0,  1,  7, 19, -1, -1],
+                                [ 0,  2,  8, 20, -1, -1],
+                                [ 0,  2,  9, -1, -1, -1],
+                                [ 0,  3, 10, -1, -1, -1],
+                                [ 0,  3, 11, -1, -1, -1],
+                                [ 0,  4, 12, -1, -1, -1]]).cuda()
+
             input_paths = [
                 input_ids[b, self.eagle_paths] for b in range(batch_size)
             ]
@@ -2539,14 +2557,15 @@ class GenerationSession(object):
                 Returns [bs, vocab]
         """
         filtered_logits = torch.empty(
-            (self.num_eagle_heads, batch_size, self.vocab_size_padded),
+            (batch_size, 1),
             dtype=eagle_logits.dtype,
             device=eagle_logits.device)
-        eagle_logits = eagle_logits.view(self.num_eagle_heads, batch_size,
-                                           self.num_eagle_tokens + 1, -1)
+        eagle_logits = eagle_logits.view(batch_size, -1)
         for b in range(batch_size):
             idx = self.eagle_paths[best_path[b], best_path_lengths[b] - 1]
-            filtered_logits[:, b, ...] = eagle_logits[:, b, idx, ...]
+            print("Idx: ", idx, "b: ", b)
+            filtered_logits[b, ...] = eagle_logits[ b, idx]
+        print("Filtered Logits: ", filtered_logits)
         return filtered_logits
     
     def filter_medusa_logits(self, batch_size, best_path, best_path_lengths,
@@ -2575,10 +2594,10 @@ class GenerationSession(object):
         ]  # dummy token for now, TODO: update tree_ids and remove this
         # print(self.eagle_topks)
 
-        for i in range(self.num_eagle_heads):
+        for i in range(self.num_eagle_tokens):
             # print("Next Eagle Logits: ", next_eagle_logits.shape)
             eagle_token = torch.topk(next_eagle_logits[i,:, :],
-                                        self.eagle_topks[i],
+                                        self.eagle_topks[0],
                                         dim=-1).indices
             next_eagle_tokens.append(eagle_token)
         next_eagle_tokens = torch.cat(next_eagle_tokens, dim=-1)
@@ -2642,7 +2661,6 @@ class GenerationSession(object):
         # new_generated_ids [batch_size, padded_accepted_length]
         # offsets [batch_size]
         # FIXME: using fused kernel to update the padded output ids.
-        print(new_generated_ids, offsets)
         batch_size = self.output_ids.shape[0]
         for b in range(batch_size):
             self.output_ids[b, offsets[b]:(
@@ -2708,6 +2726,9 @@ class GenerationSession(object):
                                        logits, context_has_eagle_tokens,
                                        next_step_buffer, context_lengths):
         eagle_logits = self.buffer['eagle_logits']
+        print("Eagle Logits: ", eagle_logits)
+
+        print("Eagle Input Ids: ", self.buffer['eagle_input_ids'])
         best_path = None
         best_path_lengths = None
         should_stop = torch.tensor([False], dtype=bool)
@@ -2724,17 +2745,13 @@ class GenerationSession(object):
             self.spec_should_step = torch.eq(self.new_tokens.reshape(-1),
                                                self.end_ids)
             if torch.equal(self.new_tokens.reshape(-1), self.end_ids):
-                # stop if context phase output EOS
                 should_stop[0] = True
             # NOTE: only one token's medusa logit will be written in.
-            eagle_logits = eagle_logits.view(self.num_eagle_tokens + 1,
-                                               -1)[0,...]
+            # eagle_logits = eagle_logits.view(self.num_eagle_tokens + 1,
+            #                                    -1)[0,...]
             
-            next_eagle_logits = eagle_logits.reshape(self.num_eagle_heads, batch_size,-1).to(self.decoder_logits_dtype)
-            next_eagle_tokens = self.get_next_eagle_tokens(
-                batch_size, next_eagle_logits)
-            self.eagle_output_tokens = next_eagle_tokens[:, self.eagle_tree_ids[
-                -self.num_eagle_tokens:]]
+            next_eagle_tokens = eagle_logits.reshape(batch_size,-1).to(self.decoder_logits_dtype)
+            self.eagle_output_tokens = next_eagle_tokens[:, self.eagle_tree_ids[-self.num_eagle_tokens:]]
             
             self.accept_lengths = torch.ones([batch_size],
                                              dtype=torch.int32,
@@ -2748,18 +2765,16 @@ class GenerationSession(object):
                 batch_size, self.generation_input_ids.view(batch_size, -1),
                 next_token_logits.view(batch_size, self.num_eagle_tokens + 1,
                                        -1))
-            print("Best Path: ", best_path)
+            
             self.accept_lengths = torch.tensor(best_path_lengths,
                                                device=self.device)
             self.new_tokens = torch.nested.to_padded_tensor(
                 torch.nested.nested_tensor(next_main_tokens, dtype=torch.int32),
                 self.end_ids[0])  #FIXME  end id padding.
-            next_eagle_logits = self.filter_eagle_logits(
-                batch_size, best_path, best_path_lengths, eagle_logits)
-            print("Filtered Logits: ", next_eagle_logits)
-            next_eagle_tokens = self.get_next_eagle_tokens(
-                batch_size, next_eagle_logits)
-
+            # next_eagle_logits = self.filter_eagle_logits(
+            #     batch_size, best_path, best_path_lengths, eagle_logits)
+            next_eagle_tokens =next_eagle_tokens = eagle_logits.reshape(batch_size,-1).to(self.decoder_logits_dtype)
+            
             should_stop = self.early_stop_criteria(batch_size, step,
                                                    should_stop)
 
@@ -2817,10 +2832,6 @@ class GenerationSession(object):
                                            dim=-1,
                                            keepdim=True)
             self.new_tokens = next_main_token
-            print("New Tokens: ====> ", next_main_token)
-            print("Accepted Lengths: ", self.accept_lengths)
-            print("Offsets: ", self.sequence_length_buffer)
-            print("Output Ids: ", self.output_ids)
             # NOTE: stop criteria.
             self.spec_should_step = torch.eq(self.new_tokens.reshape(-1),
                                                self.end_ids)
@@ -3161,7 +3172,6 @@ class GenerationSession(object):
                     should_stop = self.process_logits_for_eagle_mode(
                         step, batch_size, input_ids, logits, False,
                         next_step_tensors, context_lengths)
-                    print("should stop: ", should_stop)
                 else:
                     if logits_processor is not None:
                         final_output_ids = self.finalize_decoder(
@@ -3332,7 +3342,6 @@ class GenerationSession(object):
             if self.is_eagle_model:
                 outputs['eagle_output_tokens'] = self.eagle_output_tokens
                 outputs['accept_lengths'] = self.accept_lengths
-                outputs['eagle_output_logits'] = self.eagle_output_logits
             return outputs
 
         benchmark_profiler = kwargs.get('benchmark_profiler', None)
@@ -3369,7 +3378,7 @@ class GenerationSession(object):
                     benchmark_profiler.record_cuda_event('first_token')
             else:
                 generation_phase_step_count = generation_phase_step_count + 1
-
+            print("generation_phase_step_count: ", generation_phase_step_count)
             print("Handle per step done with should stop", should_stop)
             if self.mapping.is_last_pp_rank():
                 if step == 0 and self.gather_context_logits:

@@ -81,8 +81,8 @@ class Tree:
                 cur_node.index = cur_index
                 cur_index += 1
 
-def generate_tree_buffers_for_eagle(tree_choices, device="cuda"):
-    TOPK = 5
+def generate_tree_buffers_for_eagle(tree_choices):
+    TOPK = 10
     tree = Tree(tree_choices)
     tree_len = tree.num_node_wchild()
 
@@ -139,10 +139,10 @@ def generate_tree_buffers_for_eagle(tree_choices, device="cuda"):
 
     # Move the tensors in the dictionary to the specified device
     tree_buffers = {
-        k: [i.clone().to(device) for i in v]
+        k: [i.clone().numpy().tolist() for i in v]
         if isinstance(v[0], torch.Tensor)
         else (
-            torch.tensor(v, device=device)
+            v.numpy().tolist()
             if isinstance(v, torch.Tensor)
             else v
         )

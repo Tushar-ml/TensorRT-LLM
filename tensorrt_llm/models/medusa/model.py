@@ -106,6 +106,7 @@ class MedusaForCausalLm(LLaMAForCausalLM):
         self.max_medusa_token_len = config.max_draft_len
 
     def forward(self, *args, **kwargs):
+        print(kwargs)
         output_original = True
         hidden_states = super().forward(*args, **kwargs)
 
