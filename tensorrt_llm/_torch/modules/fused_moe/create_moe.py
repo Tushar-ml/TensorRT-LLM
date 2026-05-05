@@ -153,6 +153,12 @@ def get_moe_cls(
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
+    elif moe_backend.upper() == "TRITON_GLM5":
+        # GLM-5 fused-MoE Triton path (Kernels B + C from
+        # `triton_kernels_glm.py`).  Same class as TRITON; the runtime
+        # branching on (DeepSeekV3 routing) + (FP8_BLOCK_SCALES quant) +
+        # (GLM-5 shape) is done inside `TritonFusedMoE`.
+        return TritonFusedMoE
     elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
         # MegaMoE (DeepGEMM): DeepGEMM fp8_fp4_mega_moe fused kernel for
         # W4A8_MXFP4_MXFP8 weights. Falls back to CutlassFusedMoE whenever
