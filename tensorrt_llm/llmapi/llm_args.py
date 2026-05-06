@@ -1275,7 +1275,7 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "TRITON_GLM5", "MARLIN",
+        "DENSEGEMM", "VANILLA", "TRITON", "CUTEDSL_SMALL_BS", "MARLIN",
         "MEGAMOE_DEEPGEMM"] = Field(
             default='AUTO',
             description="MoE backend to use. "
