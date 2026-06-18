@@ -54,7 +54,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.12
+flashinfer-python>=0.6.13  # Gemma4 hd512 requires PR #3576+#3652 (sm90_hd512 branch)
 opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29

@@ -157,6 +157,147 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
 
+    # One-engine speculative decoding (MTP/Eagle3).  Mirror TrtllmAttentionMetadata
+    # so update_spec_dec_param() can allocate/fill buffers; native fa2 paged
+    # prefill serves multi-token verification once hd512 FlashInfer is installed.
+    is_spec_decoding_enabled: bool = False
+    use_spec_decoding: bool = False
+    is_spec_dec_tree: bool = False
+    is_spec_dec_dynamic_tree: bool = False
+    max_total_draft_tokens: Optional[int] = None
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    position_offsets_stride: int = 0
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+    # MTP/Eagle3 draft loop updates these in place (mirrors TrtllmAttentionMetadata).
+    host_request_types: torch.Tensor = field(init=False)
+    kv_lens_cuda: torch.Tensor = field(init=False)
+    # Saved paged-KV state for spec-dec draft loops (see prepare_for_spec_dec).
+    _saved_paged_state: Optional[dict] = field(init=False, default=None,
+                                               repr=False)
+
+    def prepare_for_spec_dec(self, *fields) -> None:
+        """Save seq-lens plus FlashInfer paged-KV views mutated by update_for_spec_dec."""
+        super().prepare_for_spec_dec(*fields)
+        n = self.num_contexts + self.num_generations
+        if n <= 0:
+            return
+        self._saved_paged_state = {
+            'n': n,
+            '_cached_token_lens': self._cached_token_lens[:n].clone(),
+            '_paged_kv_last_page_len':
+            self._paged_kv_last_page_len[:n].clone(),
+            'paged_kv_indptr_decode': self.paged_kv_indptr_decode.clone(),
+            'num_blocks': list(self.num_blocks),
+            'num_context_blocks': self.num_context_blocks,
+            'num_generation_blocks': self.num_generation_blocks,
+        }
+
+    def restore_from_spec_dec(self) -> None:
+        super().restore_from_spec_dec()
+        if self._saved_paged_state is None:
+            return
+        state = self._saved_paged_state
+        n = state['n']
+        self._cached_token_lens[:n].copy_(state['_cached_token_lens'])
+        self._paged_kv_last_page_len[:n].copy_(state['_paged_kv_last_page_len'])
+        self.paged_kv_indptr_decode.copy_(state['paged_kv_indptr_decode'])
+        self.num_blocks = list(state['num_blocks'])
+        self.num_context_blocks = state['num_context_blocks']
+        self.num_generation_blocks = state['num_generation_blocks']
+        if self.num_contexts == 0 and self.num_generations > 0:
+            self.paged_kv_indptr = self.paged_kv_indptr_decode[:
+                                                               self.num_generations
+                                                               + 1]
+        elif self.num_contexts > 0 and self.num_generations == 0:
+            self.paged_kv_indptr = self.paged_kv_indptr_prefill[:
+                                                                self.num_contexts
+                                                                + 1]
+        self._saved_paged_state = None
+
+    def on_update_kv_lens(self) -> None:
+        """Rebuild paged-KV views after kv_lens_cuda edits during spec-dec."""
+        if getattr(self, 'use_spec_decoding', False):
+            self.update_for_spec_dec()
+            self._recompute_append_positions()
+
+    def _recompute_append_positions(self) -> None:
+        """Recompute KV-append batch_indices/positions after a kv_lens edit.
+
+        ``positions`` (the per-token write offset into each sequence's KV cache)
+        is computed in ``prepare()`` from the *pre-adjustment* kv length.  With
+        the overlap scheduler, ``_preprocess_inputs`` later corrects
+        ``kv_lens_cuda`` (the optimistic ``num_cached = past_seen + draft_len + 1``
+        is rewound to the actually-accepted length).  The paged read views are
+        refreshed by ``update_for_spec_dec``, but the append ``positions`` are
+        not, so new tokens get written one slot too far and the backbone reads a
+        stale/empty slot.  Recompute them here to match the corrected length.
+        """
+        if self.num_tokens <= 0:
+            return
+        seq_lens = flashinfer.get_seq_lens(self.paged_kv_indptr,
+                                           self.paged_kv_last_page_len,
+                                           self.page_size)
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            self.kv_indptr, seq_lens, self.num_tokens)
+        self._batch_indices[:batch_indices.size(0)].copy_(batch_indices,
+                                                          non_blocking=True)
+        self._positions[:positions.size(0)].copy_(positions,
+                                                  non_blocking=True)
+
+    def is_sm_version_trtllm_gen_kernel(self, sm: int) -> bool:
+        from .trtllm import TrtllmAttention
+        return TrtllmAttention.is_sm_version_trtllm_gen_kernel(sm)
+
+    def update_spec_dec_param(self, *args, **kwargs) -> None:
+        from .trtllm import TrtllmAttentionMetadata
+        return TrtllmAttentionMetadata.update_spec_dec_param(self, *args,
+                                                             **kwargs)
+
+    def update_position_offsets_for_cpp(self, query_len: int) -> None:
+        from .trtllm import TrtllmAttentionMetadata
+        return TrtllmAttentionMetadata.update_position_offsets_for_cpp(
+            self, query_len)
+
+    def generate_spec_decoding_generation_length(self,
+                                                 runtime_draft_len: int) -> None:
+        from .trtllm import TrtllmAttentionMetadata
+        return TrtllmAttentionMetadata.generate_spec_decoding_generation_length(
+            self, runtime_draft_len)
+
+    def update_for_spec_dec(self) -> None:
+        """Refresh paged-KV views after MTP draft-loop in-place kv_lens_cuda edits."""
+        n = self.num_contexts + self.num_generations
+        if n == 0:
+            return
+        kv_lens = self.kv_lens_cuda[:n]
+        self._cached_token_lens[:n].copy_(
+            kv_lens - self.seq_lens_kv_cuda[:n])
+        num_blocks = ((kv_lens + self.page_size - 1) // self.page_size)
+        if getattr(self, "num_blocks", None) is not None:
+            for i in range(n):
+                self.num_blocks[i] = int(num_blocks[i].item())
+            self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
+            self.num_generation_blocks = sum(
+                self.num_blocks[self.num_contexts:])
+        paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
+        self._paged_kv_last_page_len[:n].copy_(paged_kv_last_page_len)
+        if self.num_contexts == 0 and self.num_generations > 0:
+            paged_kv_indptr_decode = torch.cumsum(
+                torch.tensor([0] + self.num_blocks[self.num_contexts:],
+                             dtype=torch.int32),
+                dim=0,
+            )
+            self.paged_kv_indptr_decode[:paged_kv_indptr_decode.size(
+                0)].copy_(paged_kv_indptr_decode, non_blocking=True)
+            self.paged_kv_indptr = self.paged_kv_indptr_decode[:
+                                                               paged_kv_indptr_decode
+                                                               .size(0)]
+
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
             return True
@@ -503,6 +644,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
+        self.kv_lens_cuda = torch.empty((self.max_num_requests, ),
+                                        dtype=torch.int,
+                                        device='cuda')
+        self.host_request_types = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.int,
+                                              device='cpu',
+                                              pin_memory=prefer_pinned())
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -780,6 +928,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
+        n_seqs = self.num_contexts + self.num_generations
+        self.kv_lens_cuda[:n_seqs].copy_(kv_lens[:n_seqs], non_blocking=True)
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:n_seqs].fill_(1)
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
@@ -1600,6 +1752,78 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     out=output[:num_tokens].view(-1, self.num_heads,
                                                  self.kv_lora_rank))
 
+    def _forward_gen_prefill(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        num_contexts: int,
+        num_generations: int,
+        num_ctx_tokens: int,
+        attention_window_size: Optional[int],
+    ) -> None:
+        """Multi-token generation / spec-dec verification via fa2 paged prefill.
+
+        Batch decode assumes one Q token per sequence; MTP verification sends
+        draft_len+1 query tokens per generation request.  Reuse the paged-KV
+        prefill wrapper with a rebased generation qo_indptr and causal masking.
+        """
+        if num_generations <= 0:
+            return
+        num_gen = num_generations
+        gen_start = num_contexts
+        gen_end = num_contexts + num_gen
+
+        qo_indptr = (metadata._qo_indptr[gen_start:gen_end + 1] -
+                     metadata._qo_indptr[gen_start])
+        kv_indptr = metadata.paged_kv_indptr_decode[:num_gen + 1]
+        kv_indices = metadata._paged_kv_indices[
+            metadata.num_context_blocks:metadata.num_context_blocks +
+            metadata.num_generation_blocks]
+        kv_last_page_len = metadata._paged_kv_last_page_len[gen_start:gen_end]
+
+        q_gen = q[num_ctx_tokens:]
+        out_gen = output[num_ctx_tokens:]
+
+        backend = self.flashinfer_backend
+        if backend == "fa2":
+            backend = ("fa2" if torch.cuda.get_device_capability(0) == (9, 0)
+                       else "auto")
+
+        o_dtype = (torch.bfloat16 if q_gen.dtype in (torch.float8_e4m3fn,
+                                                     torch.float8_e5m2) else None)
+        sm_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
+        window_left = (attention_window_size
+                       if attention_window_size is not None else -1)
+
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            metadata.workspace_buffer,
+            metadata.kv_layout,
+            backend=backend,
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            metadata.page_size,
+            causal=True,
+            sm_scale=sm_scale,
+            window_left=window_left,
+            q_data_type=q_gen.dtype,
+            kv_data_type=kv_cache.dtype,
+            o_data_type=o_dtype,
+        )
+        wrapper.run(
+            q_gen,
+            kv_cache,
+            out=out_gen.view(-1, self.num_heads, self.head_dim),
+        )
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1748,6 +1972,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
+        use_spec_dec = getattr(metadata, 'use_spec_decoding', False)
+        num_gen_tokens = q.shape[0] - num_ctx_tokens
+        multi_token_gen = num_generations > 0 and num_gen_tokens > num_generations
 
         def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_prefill_wrapper(plan_params)
@@ -1760,6 +1987,42 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
+
+        # MTP/Eagle3 verification sends multiple Q tokens per generation
+        # sequence; fa2 batch decode rejects that, so use paged prefill.
+        if (use_spec_dec or multi_token_gen) and num_generations > 0:
+            effective_mask_type = attention_mask_type
+            effective_mask_data = attention_mask_data
+            if (self.flashinfer_backend == "trtllm-gen"
+                    and attention_mask_data is not None):
+                logger.warning_once("Falling back to causal attention",
+                                    key="trtllm_gen_unsupported_custom_mask")
+                effective_mask_type = int(AttentionMaskType.causal)
+                effective_mask_data = None
+            if num_contexts > 0:
+                ctx_plan = metadata.plan(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_dtype=q.dtype,
+                    kv_dtype=kv_cache.dtype,
+                    q_scaling=self.q_scaling,
+                    attention_window_size=attention_window_size,
+                    attention_mask_type=effective_mask_type,
+                    attention_mask_data=effective_mask_data,
+                    flashinfer_backend=self.flashinfer_backend)
+                prefill_forward(ctx_plan, output[:num_ctx_tokens, :])
+            self._forward_gen_prefill(
+                q=q,
+                kv_cache=kv_cache,
+                metadata=metadata,
+                output=output,
+                num_contexts=num_contexts,
+                num_generations=num_generations,
+                num_ctx_tokens=num_ctx_tokens,
+                attention_window_size=attention_window_size,
+            )
+            return
 
         # Triton prefill fallback: trtllm-gen cannot handle custom
         # (bidirectional) attention masks for head_dim>256 layers.  Use a

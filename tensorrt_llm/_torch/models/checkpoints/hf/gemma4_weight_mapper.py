@@ -186,11 +186,22 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                     new_key = _LANG_COMP + "model." + new_key[len(_LANG_COMP) :]
                 new_weights[new_key] = weights[key]
         else:
-            # Text-only: strip "model.language_model." -> "model."
+            # Text-only: strip "model.language_model." -> "model.".
+            # When loading a multimodal checkpoint into Gemma4ForCausalLM,
+            # drop vision/audio keys.
+            _MM_PREFIXES = (
+                "model.vision_tower.",
+                "model.embed_vision.",
+                "model.embed_audio.",
+                "model.audio_tower.",
+            )
             for key in list(weights.keys()):
-                new_key = key
-                if new_key.startswith(_LANG_PREFIX):
-                    new_key = "model." + new_key[len(_LANG_PREFIX) :]
+                if any(key.startswith(p) for p in _MM_PREFIXES):
+                    continue
+                if key.startswith(_LANG_PREFIX):
+                    new_key = "model." + key[len(_LANG_PREFIX) :]
+                else:
+                    new_key = key
                 new_weights[new_key] = weights[key]
 
         # Remap MoE keys: HF uses layers.N.experts/router, TRT-LLM uses layers.N.moe.experts/router

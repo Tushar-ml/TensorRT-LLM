@@ -14,8 +14,10 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import functools
 import math
-from typing import Dict, Optional, Tuple
+import os
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,7 @@ import transformers
 from packaging.version import Version
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
@@ -46,7 +49,10 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
-from ..utils import ActivationType
+from ..distributed import allgather
+from ..speculative import SpecMetadata
+from ..utils import ActivationType, create_lm_head_tp_mapping
+from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -60,9 +66,55 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
 from transformers import Gemma4TextConfig  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Scaled embedding (reused from Gemma3 pattern)
-# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _flashinfer_fa2_supports_head_dim_512() -> bool:
+    """Return True when FlashInfer fa2 can serve head_dim=512 on the current GPU.
+
+    Requires FlashInfer >= 0.6.13 with PR #3576+#3652 (fa2 hd512 kernels).
+    Set ``TRTLLM_FLASHINFER_FA2_HEAD_DIM_512=0`` to force-disable if needed.
+    """
+    if os.environ.get("TRTLLM_FLASHINFER_FA2_HEAD_DIM_512", "1") == "0":
+        return False
+    return get_sm_version() >= 90
+
+
+def _gemma4_flashinfer_backend(head_dim: int) -> str:
+    """Pick the FlashInfer sub-backend for Gemma4 hybrid attention.
+
+    trtllm-gen FMHA cubins require Blackwell (SM100/SM103).  On Hopper and
+    earlier Blackwell, fa2 serves all head dims including 512 once the
+    patched FlashInfer build is installed.
+    """
+    if get_sm_version() in (100, 103):
+        return "trtllm-gen"
+    if head_dim > 256 and not _flashinfer_fa2_supports_head_dim_512():
+        raise RuntimeError(
+            "Gemma4 global-attention layers (head_dim=512) require FlashInfer "
+            ">= 0.6.13 with fa2 hd512 support (PR #3576+#3652).  Install the "
+            "patched build or set TRTLLM_FLASHINFER_FA2_HEAD_DIM_512=0 only "
+            "after verifying an alternative backend.")
+    return "fa2"
+
+
+@functools.lru_cache(maxsize=1)
+def _trtllm_mmha_supports_head_dim_512() -> bool:
+    """Return True when TRTLLM MMHA/XQA kernels support head_dim=512 on this GPU.
+
+    Investigation (TRTLLM-12669): native TRTLLM decode on Hopper still rejects
+    head_dim=512.  Blockers in C++:
+
+    - ``decoderMaskedMultiheadAttention/tensorMapUtils.cpp``: ``TLLM_CHECK(headElems <= 256)``
+    - MMHA instantiations cap at ``kSizePerHead = 256`` (no 512 cubin)
+    - Context FMHA has limited SM90 512 support (MLA-style 576/512 only)
+
+    When SM90 head_size=512 XQA cubins land, set ``TRTLLM_MMHA_HEAD_DIM_512=1``
+    and route Gemma4 through ``attn_backend=TRTLLM``.
+    """
+    if os.environ.get("TRTLLM_MMHA_HEAD_DIM_512", "0") == "1":
+        return True
+    return get_sm_version() in (100, 103)
+
+
 class Gemma4TextScaledWordEmbedding(Embedding):
     def __init__(
         self,
@@ -260,14 +312,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Use trtllm-gen for ALL layers.  trtllm-gen has pre-compiled cubins
-        # for both H256+SWA and H512 across all supported dtypes.
-        # For FP8 KV cache (NVFP4), Q is also cast to FP8 in the FlashInfer
-        # backend so that QkvE4m3OBfloat16 context cubins can be used
-        # (context cubins require same Q/KV dtype; decode cubins support
-        # mixed dtypes natively).  Uniform backend avoids workspace
-        # corruption between different wrapper types under CUDA graphs.
-        self.attn.flashinfer_backend = "trtllm-gen"
+        # trtllm-gen has pre-compiled cubins for H256+SWA and H512 on
+        # Blackwell (SM100/SM103).  On Hopper, fa2 serves all head dims once
+        # FlashInfer >= 0.6.13 with hd512 kernels is installed.
+        self.attn.flashinfer_backend = _gemma4_flashinfer_backend(layer_head_dim)
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -723,6 +771,17 @@ class Gemma4TextModel(DecoderModel):
         pretrained = config.pretrained_config
         self.hidden_size = pretrained.hidden_size
 
+        # Empty aux_stream_dict for interface compatibility with MTPForCausalLM.
+        # Gemma4 does not use auxiliary CUDA streams within the backbone model.
+        from ..utils import AuxStreamType
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: torch.cuda.Stream(),
+            AuxStreamType.MoeShared: torch.cuda.Stream(),
+            AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
+            AuxStreamType.MoeBalancer: torch.cuda.Stream(),
+            AuxStreamType.MoeOutputMemset: torch.cuda.Stream(),
+        }
+
         # Under AttentionDP, each rank runs the full sequence locally so the
         # embedding must be replicated (tp_size=1 effectively); otherwise
         # embed_tokens is COLUMN-sharded by vocab.  This mirrors the
@@ -908,7 +967,7 @@ class Gemma4TextModel(DecoderModel):
 # Gemma4 For Causal LM
 # ---------------------------------------------------------------------------
 @register_auto_model("Gemma4ForCausalLM")
-class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -930,22 +989,36 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
 
         super().__init__(
             Gemma4TextModel(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model_config,
         )
+
+    @classmethod
+    def flashinfer_supports_one_engine_spec_decode(cls) -> bool:
+        """Whether FLASHINFER can serve one-engine speculative decoding on this GPU.
+
+        Multi-token MTP verification uses native fa2 paged prefill (not batch
+        decode) on all head dims once the hd512 FlashInfer build is installed.
+        """
+        return get_sm_version() not in (100, 103)
+
+    uses_shared_backbone_kv_for_mtp = True
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
         FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
-        bidirectional attention masks for multimodal tokens.
+        head_dim 256/512 with VSWA) and bidirectional attention masks for
+        multimodal tokens.  trtllm-gen cubins are used on Blackwell; Hopper
+        uses fa2 for all head dims (requires FlashInfer >= 0.6.13 hd512).
+
+        Decode CUDA graphs may be re-enabled on Hopper once validated with the
+        native fa2 path; default remains disabled until parity is confirmed.
         """
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        defaults = {"attn_backend": "FLASHINFER"}
+        if get_sm_version() not in (100, 103):
+            defaults["cuda_graph_config"] = None
+        return defaults
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
@@ -1044,6 +1117,28 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
 
+    def _build_attention_masks(
+        self,
+        mm_token_type_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build local and global bidirectional attention masks for multimodal tokens."""
+        local_mask = None
+        global_mask = None
+        use_bidir = getattr(self.config, "use_bidirectional_attention", None)
+        if mm_token_type_ids is not None and use_bidir == "vision":
+            global_mask = self.get_flashinfer_attention_mask(
+                mm_token_type_ids=mm_token_type_ids,
+                attn_metadata=attn_metadata,
+                effective_sliding_window=None,
+            )
+            local_mask = self.get_flashinfer_attention_mask(
+                mm_token_type_ids=mm_token_type_ids,
+                attn_metadata=attn_metadata,
+                effective_sliding_window=self.config.sliding_window,
+            )
+        return local_mask, global_mask
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1053,27 +1148,15 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        spec_metadata=None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
-        local_attention_mask_data = None
-        global_attention_mask_data = None
-        # Only build bidirectional masks when use_bidirectional_attention is
-        # set to "vision" (26B, 31B).  E2B/E4B have this as None and should
-        # use standard causal attention even for multimodal tokens.
-        use_bidir = getattr(self.config, "use_bidirectional_attention", None)
-        if mm_token_type_ids is not None and use_bidir == "vision":
-            global_attention_mask_data = self.get_flashinfer_attention_mask(
-                mm_token_type_ids=mm_token_type_ids,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=None,
-            )
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
-                mm_token_type_ids=mm_token_type_ids,
-                attn_metadata=attn_metadata,
-                effective_sliding_window=self.config.sliding_window,
-            )
+        local_attention_mask_data, global_attention_mask_data = (
+            self._build_attention_masks(mm_token_type_ids, attn_metadata)
+        )
 
-        output = self.model(
+        hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
@@ -1081,26 +1164,445 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
             ple_input_ids=kwargs.pop("ple_input_ids", None),
+            spec_metadata=spec_metadata,
             **kwargs,
         )
 
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states)
+
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
+        if self.spec_worker is not None:
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            if self.config.final_logit_softcapping is not None:
+                cap = self.config.final_logit_softcapping
+                logits = torch.tanh(logits / cap) * cap
+
+            spec_input_ids = input_ids
+            spec_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if input_ids is not None:
+                    spec_input_ids = input_ids[:attn_metadata.num_tokens]
+                if position_ids is not None:
+                    from .modeling_speculative import _slice_spec_position_ids
+                    spec_position_ids = _slice_spec_position_ids(
+                        position_ids, attn_metadata.num_tokens
+                    )
+
+            return self.spec_worker(
+                input_ids=spec_input_ids,
+                position_ids=spec_position_ids,
+                hidden_states=hidden_states,
+                logits=logits,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=self.draft_model,
+                resource_manager=resource_manager,
+            )
+
         logits = self.logits_processor.forward(
-            output,
+            hidden_states,
             self.lm_head,
             attn_metadata,
             return_context_logits,
         )
 
-        # Logit softcapping
         if self.config.final_logit_softcapping is not None:
             cap = self.config.final_logit_softcapping
             logits = torch.tanh(logits / cap) * cap
 
         return logits
 
-    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
-        weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(weights, weight_mapper)
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper = None, **kwargs):
+        if weight_mapper is not None:
+            weights = weight_mapper.preprocess_weights(weights)
+        super().load_weights(weights=weights, weight_mapper=weight_mapper, **kwargs)
         # Ensure PLE nn.Linear modules match model dtype (weight loader may
         # not handle raw nn.Linear correctly, leaving them as float32).
         self.model._ensure_ple_dtype()
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 MTP (Multi-Token Prediction) support
+# ---------------------------------------------------------------------------
+
+class Gemma4MTPHead(nn.Module):
+    """Final RMSNorm + lm_head projection for Gemma4 MTP output.
+
+    Called by the MTP worker as ``mtp_layer.shared_head(hidden_states, lm_head, attn_metadata)``
+    after ``mtp_layer.forward`` has already applied the norm and returned the normalised
+    hidden states.  This forward therefore only selects the last-token states per sequence
+    and computes logits via the shared ``lm_head``.
+    """
+
+    def __init__(self, model_config: ModelConfig[Gemma4TextConfig]):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.mapping_lm_head_tp = None
+
+    @torch.compile(options={"max-autotune": True})
+    def get_last_token_states(self, hidden_states: torch.Tensor,
+                              attn_metadata: AttentionMetadata) -> torch.Tensor:
+        last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0,
+                                   dtype=torch.long) - 1
+        return hidden_states[last_tokens]
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lm_head: Linear,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self.get_last_token_states(hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        enable_lm_head_tp_in_adp = (enable_attention_dp
+                                    and self.model_config.mapping.enable_lm_head_tp_in_adp)
+
+        if enable_lm_head_tp_in_adp:
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping, hidden_states.shape[0])
+            hidden_states = allgather(hidden_states, self.mapping_lm_head_tp, dim=0)
+
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = False
+        target_dtype = lm_head.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
+        logits = lm_head(hidden_states,
+                         mapping_lm_head_tp=self.mapping_lm_head_tp,
+                         is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = True
+        return logits
+
+
+class Gemma4MTPDecoderLayer(DecoderLayer):
+    """Single decoder layer for Gemma4 MTP with Q-only (KV-shared) attention.
+
+    Unlike ``Gemma4DecoderLayer``, this layer:
+    - Always uses ``is_kv_shared=True`` (no K/V projections)
+    - Accepts explicit ``is_sliding`` and ``cache_layer_idx`` parameters
+    - Skips PLE / MoE features (not present in the assistant model)
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+        layer_idx: int,
+        is_sliding: bool,
+        cache_layer_idx: int,
+    ) -> None:
+        super().__init__()
+        config = model_config.pretrained_config
+
+        self.self_attn = Gemma4Attention(
+            model_config,
+            layer_idx=layer_idx,
+            is_sliding=is_sliding,
+            is_kv_shared=True,
+            cache_layer_idx=cache_layer_idx,
+        )
+
+        mlp_tp_size = 1 if model_config.mapping.enable_attention_dp else None
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=False,
+            activation=gelu_tanh,
+            dtype=config.torch_dtype,
+            config=model_config,
+            layer_idx=layer_idx,
+            overridden_tp_size=mlp_tp_size,
+        )
+
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.pre_feedforward_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+        self.register_buffer(
+            "layer_scalar",
+            torch.ones(1, dtype=config.torch_dtype),
+        )
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        target_dtype = self.input_layernorm.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            **kwargs,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        hidden_states = hidden_states * self.layer_scalar
+        return hidden_states
+
+
+class Gemma4MTP(DecoderLayer):
+    """Gemma4 MTP (Multi-Token Prediction) layer for one-engine speculative decoding.
+
+    Faithfully implements the Gemma4 assistant model architecture:
+      1. ``backbone_embed_tokens(input_ids)`` → ``[seq, backbone_H]``
+         Concat with ``backbone_hidden`` → ``[seq, 2 * backbone_H]``  (e.g. 10752)
+      2. ``pre_projection``: ``2*backbone_H → assistant_H`` (e.g. 10752 → 1024)
+      3. N ``Gemma4MTPDecoderLayer`` blocks at ``assistant_H`` with KV-sharing
+         (the assistant's own embed_tokens is NOT used in this path)
+      4. Final RMSNorm at ``assistant_H`` (``self.norm``)
+      5. ``post_projection``: ``assistant_H → backbone_H`` (e.g. 1024 → 5376)
+      6. shared lm_head (from backbone)
+
+    The ``cache_layer_idx`` for each decoder sub-layer is computed from the backbone
+    config so MTP layers share the backbone's KV cache.
+
+    Args:
+        model_config: Backbone model config (``Gemma4TextConfig``).
+        layer_idx: Absolute layer index starting at ``backbone.num_hidden_layers``.
+        aux_stream_dict: Auxiliary CUDA stream dict (unused; accepted for interface compat).
+        mtp_layer_types: Optional list of layer type strings for the MTP decoder sub-layers.
+        assistant_text_config: HF ``Gemma4TextConfig`` for the assistant model.  When
+            provided, the assistant's ``hidden_size`` and ``intermediate_size`` are used
+            for the internal decoder layers; otherwise falls back to backbone dimensions
+            (legacy behaviour, will produce wrong-shaped layers for standard checkpoints).
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Gemma4TextConfig],
+        layer_idx: int,
+        aux_stream_dict: Dict,
+        mtp_layer_types: Optional[List[str]] = None,
+        assistant_text_config=None,
+    ) -> None:
+        super().__init__()
+        import copy
+        from dataclasses import replace as dc_replace
+
+        config = model_config.pretrained_config  # backbone config
+        self.model_config = model_config
+        backbone_hidden_size = config.hidden_size  # e.g. 5376
+
+        # Determine assistant-model internal hidden size.
+        # The HF Gemma4 assistant has a SMALLER internal dim (e.g. 1024) that
+        # the decoder sub-layers operate in, different from backbone_hidden_size.
+        if assistant_text_config is not None:
+            asst_hidden_size = assistant_text_config.hidden_size       # e.g. 1024
+            asst_intermediate_size = assistant_text_config.intermediate_size  # e.g. 8192
+        else:
+            asst_hidden_size = backbone_hidden_size
+            asst_intermediate_size = config.intermediate_size
+
+        self._asst_hidden_size = asst_hidden_size
+
+        # --- pre_projection: [2*backbone_H] → [asst_H] ---
+        # ROW parallel: each rank receives a shard of the concatenated input
+        # (the caller does torch.chunk before calling this module).
+        if model_config.mapping.enable_attention_dp:
+            self.pre_projection = Linear(
+                backbone_hidden_size * 2,
+                asst_hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+        else:
+            self.pre_projection = Linear(
+                backbone_hidden_size * 2,
+                asst_hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+
+        # Build assistant model_config: same as backbone but with assistant dims.
+        if asst_hidden_size != backbone_hidden_size:
+            asst_pretrained = copy.copy(config)
+            asst_pretrained.hidden_size = asst_hidden_size
+            asst_pretrained.intermediate_size = asst_intermediate_size
+            asst_model_config = dc_replace(model_config,
+                                           pretrained_config=asst_pretrained)
+        else:
+            asst_model_config = model_config
+
+        # Compute which backbone layer each MTP sub-layer should share KV with.
+        # (Uses backbone config for cache_layer_idx.)
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_idx = config.num_hidden_layers - num_kv_shared
+
+        _last_own_kv: Dict[str, int] = {}
+        for i in range(first_kv_shared_idx - 1, -1, -1):
+            t = config.layer_types[i]
+            if t not in _last_own_kv:
+                _last_own_kv[t] = i
+
+        # Infer MTP sub-layer types when not provided.
+        if mtp_layer_types is None:
+            mtp_layer_types = [
+                config.layer_types[layer_idx % config.num_hidden_layers]
+            ]
+
+        # Build MTP decoder sub-layers at assistant dims.
+        self.mtp_layers = nn.ModuleList()
+        for sub_i, layer_type in enumerate(mtp_layer_types):
+            is_sliding = layer_type == "sliding_attention"
+            cache_layer_idx = _last_own_kv.get(
+                layer_type,
+                first_kv_shared_idx - 1 if first_kv_shared_idx > 0 else 0,
+            )
+            self.mtp_layers.append(
+                Gemma4MTPDecoderLayer(
+                    asst_model_config,       # assistant dims
+                    layer_idx=layer_idx + sub_i,
+                    is_sliding=is_sliding,
+                    cache_layer_idx=cache_layer_idx,
+                )
+            )
+
+        # Final RMSNorm at assistant hidden size (corresponds to model.norm in HF ckpt).
+        self.norm = RMSNorm(
+            hidden_size=asst_hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+        )
+
+        # post_projection: [asst_H] → [backbone_H] (only when dims differ).
+        # Uses COLUMN parallel so each rank outputs a shard then all-gathers.
+        if asst_hidden_size != backbone_hidden_size:
+            if model_config.mapping.enable_attention_dp:
+                self.post_projection = Linear(
+                    asst_hidden_size,
+                    backbone_hidden_size,
+                    bias=False,
+                    dtype=config.torch_dtype,
+                    skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                )
+            else:
+                self.post_projection = Linear(
+                    asst_hidden_size,
+                    backbone_hidden_size,
+                    bias=False,
+                    dtype=config.torch_dtype,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    mapping=model_config.mapping,
+                    gather_output=True,
+                    skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                )
+        else:
+            self.post_projection = None
+
+        # shared_head: wraps the backbone's lm_head and an (unused) RMSNorm.
+        # The norm is applied explicitly via self.norm above; the shared_head is
+        # kept for interface compatibility with Eagle3OneModelWorker._forward_linear_draft_loop.
+        self.shared_head = Gemma4MTPHead(model_config)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # 1. Embed input tokens using the BACKBONE embedding table (backbone_H dim).
+        #    pre_projection expects [backbone_embed || backbone_hidden] = 2*backbone_H.
+        #    (The assistant checkpoint's model.embed_tokens is for standalone use only.)
+        inputs_embeds = embed_tokens(input_ids)
+
+        target_dtype = self.pre_projection.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
+        if inputs_embeds.dtype != target_dtype:
+            inputs_embeds = inputs_embeds.to(target_dtype)
+
+        # 2. Concatenate [backbone_embed(backbone_H), backbone_hidden(backbone_H)] = 2*backbone_H,
+        #    then project to assistant hidden size via pre_projection.
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+
+        # ROW-parallel split: each rank processes its shard of the 2*backbone_H concat.
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+
+        hidden_states = self.pre_projection(hidden_states)  # → asst_H
+
+        # 3. Run through MTP decoder sub-layers at assistant hidden size.
+        for mtp_layer in self.mtp_layers:
+            hidden_states = mtp_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                **kwargs,
+            )
+
+        # 4. Apply final norm at assistant hidden size.
+        hidden_states = self.norm(hidden_states)
+
+        # 5. Project back to backbone hidden size for shared lm_head.
+        if self.post_projection is not None:
+            hidden_states = self.post_projection(hidden_states)  # → backbone_H
+
+        # 6. Capture hidden states for the spec worker.
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+
+        return hidden_states
