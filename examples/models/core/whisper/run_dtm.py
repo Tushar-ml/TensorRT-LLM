@@ -126,6 +126,20 @@ def _count_accepted(d_ids, t_ids):
     return accepted
 
 
+def _split_encoder_outputs(encoder_output, batch_size, encoder_output_lengths=None):
+    if batch_size == 1:
+        return [encoder_output]
+    if encoder_output.dim() == 2 and encoder_output_lengths is not None:
+        outputs = []
+        offset = 0
+        for length in encoder_output_lengths:
+            length = int(length)
+            outputs.append(encoder_output[offset:offset + length])
+            offset += length
+        return outputs
+    return [encoder_output[i] for i in range(batch_size)]
+
+
 def run_whisper_dtm(prefix,
                     target_runner,
                     draft_decoder,
@@ -141,14 +155,12 @@ def run_whisper_dtm(prefix,
                     temperature=0.0,
                     top_k=1,
                     top_p=0.0,
-                    profile=False):
+                    profile=False,
+                    sync_identical_batch=False):
+    batch_size = len(prefix)
     input_len = len(prefix[0])
     max_seq_len = input_len + max_output_len
     prefix = [p.clone() for p in prefix]
-
-    output_ids = torch.full((max_seq_len, ), end_id, dtype=torch.int32)
-    output_ids[:input_len] = prefix[0]
-    sequence_length = input_len
 
     n_draft_tokens = 0
     n_accept_tokens = 0
@@ -157,8 +169,12 @@ def run_whisper_dtm(prefix,
     profiler = IterationProfiler(enabled=profile)
 
     if target_encoder_output is not None:
+        encoder_outputs = (
+            target_encoder_output if isinstance(target_encoder_output, list)
+            else _split_encoder_outputs(target_encoder_output, batch_size,
+                                        target_encoder_output_lengths))
         target_gen_common = dict(
-            encoder_outputs=[target_encoder_output],
+            encoder_outputs=encoder_outputs,
             encoder_output_lengths=target_encoder_output_lengths,
             end_id=end_id,
             pad_id=end_id,
@@ -188,31 +204,37 @@ def run_whisper_dtm(prefix,
     while True:
         n_iteration += 1
         prefix_len = len(prefix[0])
+        if any(len(p) != prefix_len for p in prefix):
+            raise RuntimeError(
+                'Batched DTM requires equal prefix lengths across batch items.')
         if prefix_len >= max_seq_len - 1:
             break
 
         draft_t0 = time.time()
-        d_ids = [[end_id]]
+        draft_tokens_list = [[end_id] for _ in range(batch_size)]
         d_len = 0
         used_ngram = False
         if draft_mode in ('ngram', 'hybrid') and ngram_pool is not None:
-            d_ids = ngram_pool.get_draft_tokens(prefix)
-            d_len = len(d_ids[0])
-            used_ngram = d_len > 0 and d_ids[0][0] != end_id
+            ngram_draft = ngram_pool.get_draft_tokens(prefix)[0]
+            d_len = len(ngram_draft)
+            used_ngram = d_len > 0 and ngram_draft[0] != end_id
             if used_ngram:
                 n_ngram_hits += 1
+                draft_tokens_list = [ngram_draft[:] for _ in range(batch_size)]
         if draft_mode == 'ngram' or (draft_mode == 'hybrid'
                                      and not used_ngram):
             if draft_decoder is not None:
-                d_ids, d_len = draft_decoder.propose(prefix, end_id, draft_len)
+                draft_tokens_list, d_len = draft_decoder.propose(
+                    prefix, end_id, draft_len)
         elif draft_mode == 'turbo' and draft_decoder is not None:
-            d_ids, d_len = draft_decoder.propose(prefix, end_id, draft_len)
+            draft_tokens_list, d_len = draft_decoder.propose(
+                prefix, end_id, draft_len)
         draft_ms = (time.time() - draft_t0) * 1000.0
 
         target_t0 = time.time()
         target = target_runner.generate(
             batch_input_ids=prefix,
-            draft_tokens_list=d_ids,
+            draft_tokens_list=draft_tokens_list,
             draft_logits_list=None,
             max_new_tokens=draft_len + 1,
             **target_gen_common,
@@ -220,30 +242,44 @@ def run_whisper_dtm(prefix,
         torch.cuda.synchronize()
         target_ms = (time.time() - target_t0) * 1000.0
 
-        t_seq_len = target['sequence_lengths'][0, 0].item()
-        t_seq_len = min(t_seq_len, max_seq_len)
-        t_ids = target['output_ids'][0, 0, prefix_len:t_seq_len].tolist()
-        accepted = _count_accepted(d_ids, t_ids)
+        batch_accepted = 0
+        batch_draft_count = 0
+        new_prefix = []
+        all_done = True
+        for bi in range(batch_size):
+            t_seq_len = target['sequence_lengths'][bi, 0].item()
+            t_seq_len = min(t_seq_len, max_seq_len)
+            t_ids = target['output_ids'][bi, 0, prefix_len:t_seq_len].tolist()
+            accepted = _count_accepted([draft_tokens_list[bi]], t_ids)
+            batch_accepted += accepted
+            batch_draft_count += max(len(draft_tokens_list[bi]), 0)
 
-        output_ids[prefix_len:t_seq_len] = torch.tensor(t_ids,
-                                                          dtype=torch.int32)
-        sequence_length = t_seq_len
-        n_draft_tokens += max(d_len, 0)
-        n_accept_tokens += accepted
-        profiler.record(n_iteration, prefix_len, draft_ms, target_ms, accepted,
-                        d_len)
+            if accepted < len(draft_tokens_list[bi]) and draft_decoder is not None:
+                draft_decoder.on_rejection(bi)
+            elif draft_decoder is not None:
+                draft_decoder.commit_prefix(t_seq_len, bi)
 
-        if accepted < d_len and draft_decoder is not None:
-            draft_decoder.on_rejection()
-        elif draft_decoder is not None:
-            draft_decoder.commit_prefix(t_seq_len)
+            new_prefix.append(
+                target['output_ids'][bi, 0, :t_seq_len].clone())
+            if t_seq_len <= prefix_len:
+                continue
+            if end_id in target['output_ids'][bi, 0, prefix_len:t_seq_len]:
+                continue
+            all_done = False
 
-        if t_seq_len <= prefix_len:
+        prefix = new_prefix
+        if sync_identical_batch and batch_size > 1:
+            leader = prefix[0].clone()
+            prefix = [leader.clone() for _ in range(batch_size)]
+        n_draft_tokens += batch_draft_count
+        n_accept_tokens += batch_accepted
+        profiler.record(n_iteration, prefix_len, draft_ms, target_ms,
+                        batch_accepted, batch_draft_count)
+
+        if all_done:
             break
-        if end_id in target['output_ids'][0, 0, prefix_len:t_seq_len]:
-            break
-        prefix = [target['output_ids'][0, 0, :t_seq_len].clone()]
 
+    output_ids = prefix[0]
     stats = {
         'iterations': n_iteration,
         'draft_tokens': n_draft_tokens,
@@ -254,21 +290,22 @@ def run_whisper_dtm(prefix,
         'ngram_hit_rate':
         (n_ngram_hits / n_iteration if n_iteration > 0 else 0.0),
         'profile': profiler.summary(),
+        'batch_size': batch_size,
     }
     if profile:
         profiler.print_summary()
-    return output_ids[:sequence_length], stats
+    return output_ids, stats
 
 
 def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
-                   mel, mel_input_lengths):
+                   mel, mel_input_lengths, batch_size=1):
     shared_fraction = getattr(args, 'kv_cache_free_gpu_memory_fraction', None)
     draft_fraction = shared_fraction if shared_fraction is not None else args.draft_kv_cache_free_gpu_memory_fraction
     target_fraction = shared_fraction if shared_fraction is not None else args.target_kv_cache_free_gpu_memory_fraction
 
     common_runner_kwargs = dict(
         is_enc_dec=True,
-        max_batch_size=1,
+        max_batch_size=batch_size,
         max_input_len=3000,
         max_output_len=args.max_output_len,
         max_beam_width=1,
@@ -310,11 +347,17 @@ def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
 
 
 def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
-              mel, mel_input_lengths, duration, end_id):
+              mel, mel_input_lengths, duration, end_id, batch_size=1,
+              sync_identical_batch=False):
     runtime_rank = tensorrt_llm.mpi_rank()
+    if batch_size > 1:
+        mel = mel.repeat(batch_size, 1, 1)
+        mel_input_lengths = mel_input_lengths.repeat(batch_size)
+        prefix = [prefix[0].clone() for _ in range(batch_size)]
+
     draft_decoder, target_runner = _build_runners(
         args, draft_device_list, target_device_list, runtime_rank, mel,
-        mel_input_lengths)
+        mel_input_lengths, batch_size=batch_size)
     if isinstance(draft_decoder, PersistentWhisperDraftDecoder):
         draft_decoder.encode_once(mel.transpose(1, 2), mel_input_lengths)
 
@@ -323,11 +366,11 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         ngram_pool = NgramDraftPool(draft_len, args.ngram_max_matching_size,
                                     end_id)
 
-    target_encoder_output = None
-    target_encoder_output_lengths = None
     target_encoder = WhisperEncoding(Path(args.target_engine_dir))
     target_encoder_output, target_encoder_output_lengths = target_encoder.get_audio_features(
         mel.transpose(1, 2), mel_input_lengths)
+    encoder_outputs = _split_encoder_outputs(
+        target_encoder_output, batch_size, target_encoder_output_lengths.tolist())
 
     start = time.time()
     output_ids, stats = run_whisper_dtm(
@@ -341,16 +384,19 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         args.max_output_len,
         mel,
         mel_input_lengths,
-        target_encoder_output=target_encoder_output,
+        target_encoder_output=encoder_outputs,
         target_encoder_output_lengths=target_encoder_output_lengths.tolist(),
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
         profile=args.profile,
+        sync_identical_batch=sync_identical_batch or batch_size > 1,
     )
     elapsed = time.time() - start
     stats['elapsed'] = elapsed
-    stats['rtf'] = elapsed / duration
+    stats['elapsed_per_seq'] = elapsed / batch_size
+    stats['rtf'] = elapsed / (duration * batch_size)
+    stats['rtf_per_seq'] = stats['elapsed_per_seq'] / duration
     return output_ids, stats
 
 

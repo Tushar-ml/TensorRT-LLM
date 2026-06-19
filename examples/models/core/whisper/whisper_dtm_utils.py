@@ -7,6 +7,20 @@ from ordered_set import OrderedSet
 from run import WhisperDecoding, WhisperEncoding
 
 
+def _split_encoder_outputs(encoder_output, batch_size, encoder_output_lengths=None):
+    if batch_size == 1:
+        return [encoder_output]
+    if encoder_output.dim() == 2 and encoder_output_lengths is not None:
+        outputs = []
+        offset = 0
+        for length in encoder_output_lengths:
+            length = int(length)
+            outputs.append(encoder_output[offset:offset + length])
+            offset += length
+        return outputs
+    return [encoder_output[i] for i in range(batch_size)]
+
+
 class NgramDraftPool:
     """Lightweight ngram draft pool adapted from examples/ngram/run_dtm_ngram.py."""
 
@@ -87,23 +101,30 @@ class CppDraftRunner:
             return_dict=True,
         )
         if self._encoder_output is not None:
-            gen_kwargs['encoder_outputs'] = [self._encoder_output]
-            gen_kwargs['encoder_output_lengths'] = self._encoder_output_lengths.tolist(
-            )
+            gen_kwargs['encoder_outputs'] = _split_encoder_outputs(
+                self._encoder_output, len(prefix),
+                self._encoder_output_lengths.tolist())
+            gen_kwargs['encoder_output_lengths'] = (
+                self._encoder_output_lengths.tolist())
         else:
             gen_kwargs['encoder_input_features'] = self.mel
             gen_kwargs['encoder_output_lengths'] = (
                 self.mel_input_lengths // 2).tolist()
 
         draft = self.runner.generate(**gen_kwargs)
-        prefix_len = len(prefix[0])
-        d_seq_len = draft['sequence_lengths'][0, 0].item()
-        if d_seq_len <= prefix_len:
-            return [[end_id]], 0
-        d_ids = [
-            draft['output_ids'][0, 0, prefix_len:d_seq_len].tolist()
-        ]
-        return d_ids, d_seq_len - prefix_len
+        draft_tokens_list = []
+        max_d_len = 0
+        for bi in range(len(prefix)):
+            prefix_len = len(prefix[bi])
+            d_seq_len = draft['sequence_lengths'][bi, 0].item()
+            if d_seq_len <= prefix_len:
+                draft_tokens_list.append([end_id])
+                continue
+            draft_ids = draft['output_ids'][bi, 0,
+                                            prefix_len:d_seq_len].tolist()
+            draft_tokens_list.append(draft_ids)
+            max_d_len = max(max_d_len, len(draft_ids))
+        return draft_tokens_list, max_d_len
 
     def commit_prefix(self, prefix_len):
         return
@@ -140,13 +161,42 @@ class PersistentWhisperDraftDecoder:
         self.decoder.rewind_draft_session()
 
     def propose(self, prefix, end_id, draft_len):
+        batch_size = len(prefix)
+        if batch_size == 1:
+            prefix_len = len(prefix[0])
+            force_reset = self._needs_reset or prefix_len < self._committed_prefix_len
+            if force_reset:
+                self._needs_reset = False
+                self._committed_prefix_len = 0
+
+            decoder_input_ids = prefix[0].unsqueeze(0).cuda()
+            output_ids = self.decoder.propose_draft(
+                decoder_input_ids,
+                self._encoder_output,
+                self._encoder_max_input_length,
+                self._encoder_output_lengths,
+                end_id,
+                draft_len,
+                force_reset=force_reset,
+            )
+            seq = output_ids[0][0]
+            if isinstance(seq, torch.Tensor):
+                seq = seq.tolist()
+            seq_len = len(seq)
+            if seq_len <= prefix_len:
+                return [[end_id]], 0
+            draft_ids = seq[prefix_len:seq_len]
+            self._committed_prefix_len = prefix_len
+            return [draft_ids], len(draft_ids)
+
         prefix_len = len(prefix[0])
         force_reset = self._needs_reset or prefix_len < self._committed_prefix_len
         if force_reset:
             self._needs_reset = False
             self._committed_prefix_len = 0
 
-        decoder_input_ids = prefix[0].unsqueeze(0).cuda()
+        decoder_input_ids = torch.stack(
+            [p.cuda() for p in prefix]).type(torch.int32)
         output_ids = self.decoder.propose_draft(
             decoder_input_ids,
             self._encoder_output,
@@ -156,21 +206,29 @@ class PersistentWhisperDraftDecoder:
             draft_len,
             force_reset=force_reset,
         )
-        seq = output_ids[0][0]
-        if isinstance(seq, torch.Tensor):
-            seq = seq.tolist()
-        seq_len = len(seq)
-        if seq_len <= prefix_len:
-            return [[end_id]], 0
-        draft_ids = seq[prefix_len:seq_len]
+        draft_tokens_list = []
+        max_d_len = 0
+        for bi in range(batch_size):
+            seq = output_ids[bi][0]
+            if isinstance(seq, torch.Tensor):
+                seq = seq.tolist()
+            seq_len = len(seq)
+            if seq_len <= prefix_len:
+                draft_tokens_list.append([end_id])
+                continue
+            draft_ids = seq[prefix_len:seq_len]
+            draft_tokens_list.append(draft_ids)
+            max_d_len = max(max_d_len, len(draft_ids))
         self._committed_prefix_len = prefix_len
-        return [draft_ids], len(draft_ids)
+        return draft_tokens_list, max_d_len
 
-    def commit_prefix(self, prefix_len):
-        self._committed_prefix_len = prefix_len
+    def commit_prefix(self, prefix_len, batch_index=0):
+        if batch_index == 0:
+            self._committed_prefix_len = prefix_len
 
-    def on_rejection(self):
-        self.reset_session()
+    def on_rejection(self, batch_index=0):
+        if batch_index == 0:
+            self.reset_session()
 
 
 class IterationProfiler:
