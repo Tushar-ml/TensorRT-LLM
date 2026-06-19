@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -444,6 +444,22 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         //    - only hopper warp-specialized kernels have this optimization.
         //    - it doesn't work with attention logit softcapping.
         mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableAttnLogitSoftcapping;
+    }
+
+    // Regular (non-MLA) head_size=512 has no Hopper warp-specialized FMHA kernel.
+    // Route it to the Ampere-style (non-warp-spec, tiled) HMMA flash kernel that
+    // is generated for sm90 (head_size==head_size_v==512), mirroring the MLA
+    // treatment below. Without this, kernel selection would request the warp-spec
+    // path and hit an unsupported-config assert in get_warps().
+    if (isSm90 && mLaunchParams.flash_attention && mFixedParams.headSize == 512
+        && mFixedParams.headSize == mFixedParams.headSizeV)
+    {
+        mLaunchParams.warp_specialization = false;
+        mLaunchParams.use_tma = false;
+        mLaunchParams.dynamic_scheduler = false;
+        mLaunchParams.useKernelWithoutAlibi = false;
+        mLaunchParams.useBase2ExpTrick = false;
+        mLaunchParams.granular_tiling = true;
     }
 
     // TODO: Refactor these dirty hacks.

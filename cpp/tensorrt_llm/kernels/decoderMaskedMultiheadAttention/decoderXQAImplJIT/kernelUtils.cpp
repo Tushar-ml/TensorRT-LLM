@@ -145,6 +145,12 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     return true;
 }
 
+// NOTE on head_size 512 (Gemma4 global attention): the QGMMA/HMMA XQA JIT kernels are not
+// templated for head_size > 256 (the Q/K/V smem tiles and GMMA accumulators assume <= 256), and a
+// 512-elem bf16 row (1024B) does not fit the Hopper SMEM budget for the QGMMA path. We therefore
+// keep the head_size gate at 256 in both supportConfigQGMMA and supportConfigHMMA so XQA-512 returns
+// false and falls back to MMHA, which does support head_size 512. tensorMapUtils.cpp is already
+// extended for 512 so this can be revisited if a 512-capable XQA kernel is added.
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {
     if (!supportConfigCommon(xqaParams, forConfigurePlugin))

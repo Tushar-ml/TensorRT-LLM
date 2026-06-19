@@ -98,21 +98,23 @@ def _gemma4_flashinfer_backend(head_dim: int) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _trtllm_mmha_supports_head_dim_512() -> bool:
-    """Return True when TRTLLM MMHA/XQA kernels support head_dim=512 on this GPU.
+    """Return True when TRTLLM attention kernels support head_dim=512 on this GPU.
 
-    Investigation (TRTLLM-12669): native TRTLLM decode on Hopper still rejects
-    head_dim=512.  Blockers in C++:
+    - Blackwell (SM100/SM103): trtllm-gen FMHA + MMHA cubins handle hd512.
+    - Hopper (SM90): regular hd512 context FMHA (Ampere-style HMMA flash, routed
+      non-warp-spec in ``fmhaRunner``) and decode MMHA hd512 kernels were added
+      (``decoderMaskedMultiheadAttention`` ``case 512`` + ``512_*`` instantiations,
+      ``tensorMapUtils`` headElems<=512).  XQA hd512 stays gated off and falls
+      back to MMHA.  Validated against the HF reference
+      (``test_modeling_gemma4.py::test_hd512_trtllm_config``).
 
-    - ``decoderMaskedMultiheadAttention/tensorMapUtils.cpp``: ``TLLM_CHECK(headElems <= 256)``
-    - MMHA instantiations cap at ``kSizePerHead = 256`` (no 512 cubin)
-    - Context FMHA has limited SM90 512 support (MLA-style 576/512 only)
-
-    When SM90 head_size=512 XQA cubins land, set ``TRTLLM_MMHA_HEAD_DIM_512=1``
-    and route Gemma4 through ``attn_backend=TRTLLM``.
+    ``TRTLLM_MMHA_HEAD_DIM_512`` overrides the GPU check: ``=1`` force-enable
+    (e.g. to try other arches), ``=0`` force-disable (fall back to FlashInfer).
     """
-    if os.environ.get("TRTLLM_MMHA_HEAD_DIM_512", "0") == "1":
-        return True
-    return get_sm_version() in (100, 103)
+    override = os.environ.get("TRTLLM_MMHA_HEAD_DIM_512")
+    if override is not None:
+        return override == "1"
+    return get_sm_version() in (90, 100, 103)
 
 
 class Gemma4TextScaledWordEmbedding(Embedding):
@@ -312,10 +314,16 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # trtllm-gen has pre-compiled cubins for H256+SWA and H512 on
-        # Blackwell (SM100/SM103).  On Hopper, fa2 serves all head dims once
-        # FlashInfer >= 0.6.13 with hd512 kernels is installed.
-        self.attn.flashinfer_backend = _gemma4_flashinfer_backend(layer_head_dim)
+        # FlashInfer sub-backend selection is only meaningful for the FlashInfer
+        # attention backend.  The TRTLLM backend selects its own kernels by
+        # head_dim (incl. the hd512 path on SM90), so skip this there — calling
+        # _gemma4_flashinfer_backend(512) would also wrongly require a FlashInfer
+        # hd512 build when running on TRTLLM.
+        if model_config.attn_backend == "FLASHINFER":
+            # trtllm-gen has pre-compiled cubins for H256+SWA and H512 on
+            # Blackwell (SM100/SM103).  On Hopper, fa2 serves all head dims once
+            # FlashInfer >= 0.6.13 with hd512 kernels is installed.
+            self.attn.flashinfer_backend = _gemma4_flashinfer_backend(layer_head_dim)
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -1007,14 +1015,22 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA) and bidirectional attention masks for
-        multimodal tokens.  trtllm-gen cubins are used on Blackwell; Hopper
-        uses fa2 for all head dims (requires FlashInfer >= 0.6.13 hd512).
+        When the TRTLLM attention backend supports Gemma4's hybrid head_dim
+        (256/512) on this GPU — Blackwell (trtllm-gen) and Hopper SM90 (the
+        hd512 HMMA context FMHA + decode MMHA kernels) — default to
+        ``attn_backend="TRTLLM"`` and leave CUDA graphs enabled.  TRTLLM has no
+        deferred multi-wrapper plan / in-forward synchronize, so it is
+        CUDA-graph-capture-safe (unlike FlashInfer for Gemma4) and lets MTP run
+        without per-call FlashInfer wrapper creation.
 
-        Decode CUDA graphs may be re-enabled on Hopper once validated with the
-        native fa2 path; default remains disabled until parity is confirmed.
+        Otherwise fall back to FlashInfer (required for hybrid head_dim / VSWA
+        and bidirectional multimodal masks) and disable decode CUDA graphs,
+        whose deferred multi-wrapper plan is not capture-safe for Gemma4.
+
+        Set ``TRTLLM_MMHA_HEAD_DIM_512=0`` to force the FlashInfer fallback.
         """
+        if _trtllm_mmha_supports_head_dim_512():
+            return {"attn_backend": "TRTLLM"}
         defaults = {"attn_backend": "FLASHINFER"}
         if get_sm_version() not in (100, 103):
             defaults["cuda_graph_config"] = None

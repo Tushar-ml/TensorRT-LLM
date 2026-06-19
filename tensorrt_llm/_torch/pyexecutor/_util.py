@@ -1578,8 +1578,17 @@ def _create_kv_cache_manager(
         if (kv_cache_config.max_attention_window is None
                 and sliding_window is not None):
             kv_cache_config = copy.copy(kv_cache_config)
+            needs_vswa = (len(set(head_dim_list)) > 1
+                          or len(set(kv_heads_list)) > 1)
+            # When sliding and full layers share different page sizes (hybrid
+            # head_dim / kv_heads), V2 must see distinct window sizes to
+            # allocate separate pool groups.  Use max_seq_len - 1 on sliding
+            # layers so we still split pools when sliding_window == max_seq_len
+            # (common in smoke/unit configs with max_seq_len=128).
+            sliding_window_val = (
+                int(max_seq_len) - 1 if needs_vswa else int(sliding_window))
             kv_cache_config.max_attention_window = [
-                int(sliding_window)
+                sliding_window_val
                 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]

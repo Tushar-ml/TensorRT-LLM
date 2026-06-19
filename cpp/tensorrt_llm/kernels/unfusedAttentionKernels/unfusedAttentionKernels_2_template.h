@@ -47,7 +47,7 @@ namespace kernels
 // One warp of threads handle one head in terms of rotary embedding.
 // Balance the work across threads in one warp for different head size.
 // The minimum head size should be 32.
-// Assume head size <= 256.
+// Assume head size <= 512.
 template <typename T, int Dh_MAX>
 struct Rotary_vec_t
 {
@@ -96,6 +96,15 @@ struct Rotary_vec_t<float, 256>
     static constexpr int size = 8;
 };
 
+template <>
+struct Rotary_vec_t<float, 512>
+{
+    using Type = mmha::Float8_;
+    using BaseType = float;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
@@ -127,6 +136,15 @@ struct Rotary_vec_t<half, 128>
 
 template <>
 struct Rotary_vec_t<half, 256>
+{
+    using Type = uint4;
+    using BaseType = uint16_t;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
+template <>
+struct Rotary_vec_t<half, 512>
 {
     using Type = uint4;
     using BaseType = uint16_t;
@@ -167,6 +185,15 @@ struct Rotary_vec_t<__nv_bfloat16, 128>
 
 template <>
 struct Rotary_vec_t<__nv_bfloat16, 256>
+{
+    using Type = mmha::bf16_8_t;
+    using BaseType = __nv_bfloat16;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
+template <>
+struct Rotary_vec_t<__nv_bfloat16, 512>
 {
     using Type = mmha::bf16_8_t;
     using BaseType = __nv_bfloat16;
@@ -1263,6 +1290,10 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     {
         kernelDispatchHeadSize<256, T, TCache, KVCacheBuffer>(params, stream);
     }
+    else if (params.size_per_head <= 512)
+    {
+        kernelDispatchHeadSize<512, T, TCache, KVCacheBuffer>(params, stream);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(
@@ -1644,6 +1675,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 192: kernelV2DispatchHeadSize<192, 192, T, TCache, KVCacheBuffer>(params, stream); break;
     case 224: kernelV2DispatchHeadSize<224, 224, T, TCache, KVCacheBuffer>(params, stream); break;
     case 256: kernelV2DispatchHeadSize<256, 256, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 512: kernelV2DispatchHeadSize<512, 512, T, TCache, KVCacheBuffer>(params, stream); break;
     case 576: kernelV2DispatchHeadSize<576, 576, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
         // Fall back to v1 kernel.

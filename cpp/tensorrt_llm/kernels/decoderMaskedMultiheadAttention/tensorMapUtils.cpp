@@ -148,8 +148,11 @@ CUtensorMap makeTensorMapForHopperXqaKVCache(
         uint32_t const headElems = xqaParams.head_size;
         CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
         uint32_t const elemBytes = getElemBytes(dataType);
-        TLLM_CHECK(headElems <= 256);
-        uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
+        TLLM_CHECK(headElems <= 512);
+        uint32_t const paddedHeadElems
+            = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : (headElems <= 256 ? 256 : 512));
+        // partElems is capped so that elemBytes * partElems <= 128 (the largest TMA swizzle is 128B),
+        // so the swizzle mode is independent of head size and the wider row is tiled by the TMA box dims.
         uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
         return makeTensorMapForPagedKVCache(driver, kv_cache_buffer.mPrimaryPoolPtr, dataType, xqaParams.head_size,
             xqaParams.num_kv_heads, xqaParams.tokens_per_block, partElems);
@@ -160,8 +163,11 @@ CUtensorMap makeTensorMapForHopperXqaKVCache(
         uint32_t const headElems = xqaParams.head_size;
         CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
         uint32_t const elemBytes = getElemBytes(dataType);
-        TLLM_CHECK(headElems <= 256);
-        uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
+        TLLM_CHECK(headElems <= 512);
+        uint32_t const paddedHeadElems
+            = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : (headElems <= 256 ? 256 : 512));
+        // partElems is capped so that elemBytes * partElems <= 128 (the largest TMA swizzle is 128B),
+        // so the swizzle mode is independent of head size and the wider row is tiled by the TMA box dims.
         uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
         return makeTensorMapForContiguousKVCache(driver, kv_cache_buffer.data, dataType, xqaParams.head_size,
             xqaParams.num_kv_heads, xqaParams.max_attention_window_size, xqaParams.beam_width, xqaParams.batch_size,

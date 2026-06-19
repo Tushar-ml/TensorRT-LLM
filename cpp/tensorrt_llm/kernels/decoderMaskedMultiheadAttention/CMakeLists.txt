@@ -42,7 +42,9 @@ endforeach()
 
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
-  set(extra_heads 256)
+  # head_size 512 is required by Gemma4 global-attention layers, keep it even in
+  # fast builds.
+  set(extra_heads 256 512)
 else()
   set(extra_heads
       48
@@ -54,7 +56,8 @@ else()
       160
       192
       224
-      256)
+      256
+      512)
 endif()
 
 foreach(HEAD ${extra_heads})

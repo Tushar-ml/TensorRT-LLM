@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -141,6 +141,13 @@ struct Qk_vec_m_<float, 256>
     using Type = float4;
 };
 
+// head_size 512 (Gemma4 global attention). Cap the Q*K vector at the 16-byte max width, same as 256.
+template <>
+struct Qk_vec_m_<float, 512>
+{
+    using Type = float4;
+};
+
 template <>
 struct Qk_vec_m_<uint16_t, 32>
 {
@@ -161,6 +168,12 @@ struct Qk_vec_m_<uint16_t, 128>
 
 template <>
 struct Qk_vec_m_<uint16_t, 256>
+{
+    using Type = uint4;
+};
+
+template <>
+struct Qk_vec_m_<uint16_t, 512>
 {
     using Type = uint4;
 };
@@ -185,6 +198,12 @@ struct Qk_vec_m_<__nv_bfloat16, 128>
 
 template <>
 struct Qk_vec_m_<__nv_bfloat16, 256>
+{
+    using Type = bf16_8_t;
+};
+
+template <>
+struct Qk_vec_m_<__nv_bfloat16, 512>
 {
     using Type = bf16_8_t;
 };
@@ -2191,13 +2210,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // Get the c_tile_id that handles the current timestep.
     int current_step_ctile_idx = kv_loop_length / timesteps_per_block;
-    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh
+    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && is_valid_qk_vec
         && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx))
     {
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
-        auto const k_idx = QK_VEC_SIZE * tidx;
-        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
+        // Match the V-cache store path: one 16B chunk per threads_per_value lane.
+        auto const k_channel = chunk_index<T, Qk_vec_k, THREADS_PER_VALUE>(tidx).y;
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_channel);
         // The base pointer for the value in the cache buffer.
         Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
 

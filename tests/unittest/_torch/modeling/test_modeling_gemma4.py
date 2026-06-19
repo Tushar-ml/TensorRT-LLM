@@ -19,6 +19,7 @@ transformers>=5.5.0 Gemma4 support.
 """
 
 import math
+import os
 import unittest
 import unittest.mock
 from copy import deepcopy
@@ -429,6 +430,17 @@ GEMMA4_HYBRID_HEADDIM_CONFIG = {
     },
 }
 
+# hd512 global layers (real Gemma4 uses sliding head_dim=256 / global head_dim=512).
+# Exercises the TRTLLM attention backend's head_dim=512 SM90 kernels: the regular
+# (non-MLA) context FMHA path and the decode MMHA path.
+GEMMA4_HD512_CONFIG = {
+    **GEMMA4_HYBRID_HEADDIM_CONFIG,
+    "num_hidden_layers": 6,  # 5 sliding (head_dim=256) + 1 full (head_dim=512)
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "num_global_key_value_heads": 2,
+}
+
 # Hybrid with different num_kv_heads per layer type (like real Gemma4 K=V models).
 # Sliding layers: kv_heads=4, Full (K=V) layers: kv_heads=1.
 # This tests V2 pool grouping — different kv_heads*head_dim means different page
@@ -697,7 +709,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             f"{failed * 100:.2f}% of elements differ (max {max_failed_frac * 100}%)",
         )
 
-    def _make_hf_and_trt_models(self, config_dict=None):
+    def _make_hf_and_trt_models(self, config_dict=None, backend="FLASHINFER"):
         """Create paired HF and TRT-LLM models with shared weights."""
         from transformers import Gemma4ForCausalLM as HFGemma4
 
@@ -711,7 +723,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         device = torch.device("cuda")
 
         hf_model = HFGemma4(config).to(dtype).to(device).eval()
-        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model_config = ModelConfig(pretrained_config=config, attn_backend=backend)
         trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
 
         wm = Gemma4HfWeightMapper()
@@ -792,6 +804,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         atol=0.5,
         rtol=0.5,
         max_failed_frac=0.01,
+        backend="FLASHINFER",
     ):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
@@ -800,11 +813,10 @@ class TestGemma4HFComparison(unittest.TestCase):
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
-        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict, backend=backend)
         hf_cache = DynamicCache()
 
         device = torch.device("cuda")
-        backend = "FLASHINFER"
 
         # Set up KV cache
         kv_cache_manager = self._get_kv_cache_manager(gemma4_config)
@@ -909,6 +921,30 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_diff_kv_heads_config(self):
         """Different num_kv_heads per layer type — tests V2 pool grouping."""
         self._run_full_model_comparison(deepcopy(GEMMA4_DIFF_KV_HEADS_CONFIG))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
+        "Gemma4 head_dim=512 TRTLLM kernels are validated on SM90 (Hopper) here.",
+    )
+    @torch.no_grad()
+    def test_hd512_trtllm_config(self):
+        """Gemma4 global head_dim=512 on the TRTLLM attention backend (SM90).
+
+        Parity gate for the new head_dim=512 kernels: regular context FMHA
+        (non-warp-spec HMMA path, routed via fmhaRunner) + decode MMHA.  Gated
+        behind TRTLLM_MMHA_HEAD_DIM_512 until the default flip lands.
+        """
+        prev = os.environ.get("TRTLLM_MMHA_HEAD_DIM_512")
+        os.environ["TRTLLM_MMHA_HEAD_DIM_512"] = "1"
+        try:
+            self._run_full_model_comparison(
+                deepcopy(GEMMA4_HD512_CONFIG), backend="TRTLLM"
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("TRTLLM_MMHA_HEAD_DIM_512", None)
+            else:
+                os.environ["TRTLLM_MMHA_HEAD_DIM_512"] = prev
 
     @torch.no_grad()
     def test_kev_config(self):
