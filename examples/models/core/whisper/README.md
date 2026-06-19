@@ -17,6 +17,7 @@ This document shows how to build and run a [whisper model](https://github.com/op
       - [Run C++ runtime](#run-c-runtime)
       - [Run Python runtime](#run-python-runtime)
       - [Advanced Usage](#advanced-usage)
+    - [Draft-Target Speculative Decoding](#draft-target-speculative-decoding)
     - [Distil-Whisper](#distil-whisper)
     - [Acknowledgment](#acknowledgment)
 
@@ -140,6 +141,137 @@ Calculates the character error rate (CER) instead of the word error rate (WER) f
 
 `--dataset`, `--dataset_name`, and `--dataset_split`
 These options allow you to select different decoding audio datasets from Hugging Face.
+
+### Draft-Target Speculative Decoding
+
+Accelerate greedy Whisper large-v3 decoding with a smaller draft decoder (e.g. `large-v3-turbo`) using [draft-target speculative decoding](../../../../docs/source/legacy/advanced/speculative-decoding.md). v1 supports **greedy decoding only** (`num_beams=1`).
+
+Build four engine dirs: draft (turbo), plain large-v3 baseline (quality reference), and DTM target (large-v3 encoder + spec-dec decoder). Turbo and large-v3 share the tokenizer/vocab but **DTM transcript quality follows the large-v3 target**, not the turbo draft.
+
+```bash
+MAX_DRAFT_LEN=4
+DRAFT_CKPT=whisper_turbo_weights
+TARGET_CKPT=whisper_large_v3_weights
+DRAFT_ENGINE=whisper_turbo_engine
+BASELINE_ENGINE=whisper_large_v3_engine
+TARGET_ENGINE=whisper_large_v3_dtm_engine
+
+# Draft model (turbo) — standard decoder build
+python3 convert_checkpoint.py --model_name large-v3-turbo --output_dir ${DRAFT_CKPT}
+# Encoder: enable padding removal for C++ IFB runtime; explicitly disable paged KV
+trtllm-build --checkpoint_dir ${DRAFT_CKPT}/encoder --output_dir ${DRAFT_ENGINE}/encoder \
+  --moe_plugin disable --max_batch_size 8 --gemm_plugin disable \
+  --bert_attention_plugin float16 --max_input_len 3000 --max_seq_len 3000 \
+  --remove_input_padding enable --kv_cache_type disabled
+# Decoder: C++ IFB runtime (paged KV + padding removal)
+trtllm-build --checkpoint_dir ${DRAFT_CKPT}/decoder --output_dir ${DRAFT_ENGINE}/decoder \
+  --moe_plugin disable --max_batch_size 8 --max_beam_width 1 \
+  --max_seq_len 114 --max_input_len 14 --max_encoder_input_len 3000 \
+  --gemm_plugin float16 --bert_attention_plugin float16 --gpt_attention_plugin float16 \
+  --remove_input_padding enable --kv_cache_type paged --use_paged_context_fmha enable
+
+# Target model (large-v3) — plain baseline + spec-dec DTM target (same checkpoint)
+python3 convert_checkpoint.py --model_name large-v3 --model_dir assets --output_dir ${TARGET_CKPT}
+
+# Plain large-v3 baseline (validate weights / compare quality before DTM)
+trtllm-build --checkpoint_dir ${TARGET_CKPT}/encoder --output_dir ${BASELINE_ENGINE}/encoder \
+  --moe_plugin disable --max_batch_size 8 --gemm_plugin disable \
+  --bert_attention_plugin float16 --max_input_len 3000 --max_seq_len 3000 \
+  --remove_input_padding enable --kv_cache_type disabled
+trtllm-build --checkpoint_dir ${TARGET_CKPT}/decoder --output_dir ${BASELINE_ENGINE}/decoder \
+  --moe_plugin disable --max_batch_size 8 --max_beam_width 1 \
+  --max_seq_len 114 --max_input_len 14 --max_encoder_input_len 3000 \
+  --gemm_plugin float16 --bert_attention_plugin float16 --gpt_attention_plugin float16 \
+  --remove_input_padding enable --kv_cache_type paged --use_paged_context_fmha enable
+
+# DTM target (rebuild encoder + spec-dec decoder; do not reuse a broken encoder build)
+trtllm-build --checkpoint_dir ${TARGET_CKPT}/encoder --output_dir ${TARGET_ENGINE}/encoder \
+  --moe_plugin disable --max_batch_size 8 --gemm_plugin disable \
+  --bert_attention_plugin float16 --max_input_len 3000 --max_seq_len 3000 \
+  --remove_input_padding enable --kv_cache_type disabled
+trtllm-build --checkpoint_dir ${TARGET_CKPT}/decoder --output_dir ${TARGET_ENGINE}/decoder \
+  --moe_plugin disable --max_batch_size 8 --max_beam_width 1 \
+  --max_seq_len 114 --max_input_len 14 --max_encoder_input_len 3000 \
+  --speculative_decoding_mode draft_tokens_external --max_draft_len ${MAX_DRAFT_LEN:-16} \
+  --gemm_plugin float16 --bert_attention_plugin float16 --gpt_attention_plugin float16 \
+  --remove_input_padding enable --kv_cache_type paged --use_paged_context_fmha enable
+```
+
+Validate large-v3 baseline before DTM (compare to turbo separately for speed only):
+
+```bash
+python3 run.py --engine_dir ${BASELINE_ENGINE} --input_file ${AUDIO} \
+  --assets_dir assets --num_beams 1 --use_py_session
+```
+
+Run optimized DTM inference (single GPU; build target decoder with `--max_draft_len 16`):
+
+```bash
+python3 run_dtm.py \
+  --draft_engine_dir ${DRAFT_ENGINE} \
+  --target_engine_dir ${TARGET_ENGINE} \
+  --baseline_engine_dir ${BASELINE_ENGINE} \
+  --draft_target_model_config="[16,[0],[0],False]" \
+  --draft_mode turbo \
+  --input_file /home/ubuntu/audio_60s_30s.wav \
+  --assets_dir assets \
+  --kv_cache_enable_block_reuse \
+  --draft_kv_cache_free_gpu_memory_fraction 0.18 \
+  --target_kv_cache_free_gpu_memory_fraction 0.28 \
+  --profile
+```
+
+Benchmark turbo vs large-v3 vs optimized DTM (single H100, 30s audio; DTM target decoder built with `--max_draft_len 16`):
+
+| Mode | Wall time | RTF |
+|------|-----------|-----|
+| Turbo | ~0.075s | 0.0025 |
+| Large-v3 | ~0.35s | 0.012 |
+| DTM (`draft_len=16`) | **~0.21s** | **0.007** |
+
+```bash
+python3 benchmark_dtm.py \
+  --input_file /home/ubuntu/audio_60s_30s.wav \
+  --assets_dir assets \
+  --draft_engine_dir ${DRAFT_ENGINE} \
+  --target_engine_dir ${TARGET_ENGINE} \
+  --baseline_engine_dir ${BASELINE_ENGINE}
+```
+
+Optional draft engine rebuild for tighter single-batch KV pools:
+
+```bash
+MAX_BATCH=1 bash build_draft_engines.sh
+# distil draft experiment:
+# DRAFT_MODEL=distil-large-v3 DRAFT_ENGINE=whisper_distil_draft_engine bash build_draft_engines.sh
+```
+
+Legacy DTM invocation (full ModelRunnerCpp draft path):
+
+```bash
+python3 run_dtm.py \
+  --draft_engine_dir ${DRAFT_ENGINE} \
+  --target_engine_dir ${TARGET_ENGINE} \
+  --draft_target_model_config="[4,[0],[1],False]" \
+  --input_file assets/1221-135766-0002.wav \
+  --assets_dir assets \
+  --kv_cache_enable_block_reuse \
+  --kv_cache_free_gpu_memory_fraction 0.45
+```
+
+Notes:
+- `--draft_target_model_config` is `[draft_len, draft_gpu_ids, target_gpu_ids, use_logits]`.
+- `--draft_len` overrides draft length (default **16** from config; rebuild DTM decoder with `--max_draft_len` ≥ chosen value).
+- `--sweep_draft_len` benchmarks `{4,6,8,10,12,16}`.
+- `--draft_mode` supports `turbo`, `ngram`, or `hybrid` draft proposals.
+- `--draft_backend cpp` (default) keeps ModelRunnerCpp draft quality; `py` uses encoder-once py_session draft.
+- `--profile` prints per-iteration draft/target latency.
+- DTM output should match `${BASELINE_ENGINE}` greedy decoding; turbo (`${DRAFT_ENGINE}`) is a different model and may differ in wording.
+- Encoder builds must use `--remove_input_padding enable --kv_cache_type disabled` (TRT-LLM 1.3+ defaults break Whisper encoder otherwise).
+- Use leader (non-orchestrator) mode for enc-dec engines; orchestrator workers do not load the Whisper encoder.
+- KV cache block reuse must be enabled on the target decoder engine.
+- Beam search is not supported with speculative decoding.
+- Optional: pass `--baseline_engine_dir ${BASELINE_ENGINE}` to `run_dtm.py` to print the plain large-v3 transcript before DTM.
 
 ### Distil-Whisper
 TensorRT LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
