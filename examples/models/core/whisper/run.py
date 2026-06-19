@@ -228,6 +228,8 @@ class WhisperDecoding:
         self.decoder_config = read_config('decoder', engine_dir)
         self.decoder_generation_session = self.get_session(
             engine_dir, runtime_mapping, debug_mode)
+        self._draft_session_active = False
+        self._draft_committed_prefix_len = 0
 
     def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
         serialize_path = engine_dir / 'decoder' / 'rank0.engine'
@@ -324,6 +326,39 @@ class WhisperDecoding:
         # get the list of int from output_ids tensor
         output_ids = output_ids.cpu().numpy().tolist()
         return output_ids
+
+
+    def propose_draft(self,
+                      decoder_input_ids,
+                      encoder_outputs,
+                      encoder_max_input_length,
+                      encoder_input_lengths,
+                      eot_id,
+                      draft_len,
+                      force_reset=False):
+        """Propose draft tokens, reusing decoder session when prefix grows monotonically."""
+        if force_reset:
+            self._draft_session_active = False
+
+        prefix_len = decoder_input_ids.shape[-1]
+        if (not getattr(self, '_draft_session_active', False)
+                or prefix_len < getattr(self, '_draft_committed_prefix_len', 0)):
+            self._draft_session_active = True
+            self._draft_committed_prefix_len = 0
+
+        output_ids = self.generate(decoder_input_ids,
+                                   encoder_outputs,
+                                   encoder_max_input_length,
+                                   encoder_input_lengths,
+                                   eot_id,
+                                   max_new_tokens=draft_len,
+                                   num_beams=1)
+        self._draft_committed_prefix_len = prefix_len
+        return output_ids
+
+    def rewind_draft_session(self):
+        self._draft_session_active = False
+        self._draft_committed_prefix_len = 0
 
 
 class WhisperTRTLLM(object):

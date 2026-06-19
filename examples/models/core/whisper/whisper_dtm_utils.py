@@ -49,22 +49,32 @@ class NgramDraftPool:
 
 
 class CppDraftRunner:
-    """ModelRunnerCpp draft proposer."""
+    """ModelRunnerCpp draft proposer with optional encoder-once cache."""
 
-    def __init__(self, runner, mel, mel_input_lengths, temperature, top_k,
-                 top_p):
+    def __init__(self,
+                 runner,
+                 mel,
+                 mel_input_lengths,
+                 temperature,
+                 top_k,
+                 top_p,
+                 draft_engine_dir=None):
         self.runner = runner
         self.mel = mel
         self.mel_input_lengths = mel_input_lengths
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self._encoder_output = None
+        self._encoder_output_lengths = None
+        if draft_engine_dir is not None:
+            encoder = WhisperEncoding(draft_engine_dir)
+            self._encoder_output, self._encoder_output_lengths = encoder.get_audio_features(
+                mel.transpose(1, 2), mel_input_lengths)
 
     def propose(self, prefix, end_id, draft_len):
-        draft = self.runner.generate(
+        gen_kwargs = dict(
             batch_input_ids=prefix,
-            encoder_input_features=self.mel,
-            encoder_output_lengths=(self.mel_input_lengths // 2).tolist(),
             max_new_tokens=draft_len,
             end_id=end_id,
             pad_id=end_id,
@@ -76,6 +86,16 @@ class CppDraftRunner:
             output_sequence_lengths=True,
             return_dict=True,
         )
+        if self._encoder_output is not None:
+            gen_kwargs['encoder_outputs'] = [self._encoder_output]
+            gen_kwargs['encoder_output_lengths'] = self._encoder_output_lengths.tolist(
+            )
+        else:
+            gen_kwargs['encoder_input_features'] = self.mel
+            gen_kwargs['encoder_output_lengths'] = (
+                self.mel_input_lengths // 2).tolist()
+
+        draft = self.runner.generate(**gen_kwargs)
         prefix_len = len(prefix[0])
         d_seq_len = draft['sequence_lengths'][0, 0].item()
         if d_seq_len <= prefix_len:
@@ -93,13 +113,13 @@ class CppDraftRunner:
 
 
 class PersistentWhisperDraftDecoder:
-    """Draft decoder with encoder-once py_session path."""
+    """Draft decoder with encoder-once py_session path and session rewind on rejection."""
 
     def __init__(self, draft_engine_dir, runtime_mapping, debug_mode=False):
         self.encoder = WhisperEncoding(draft_engine_dir)
         self.decoder = WhisperDecoding(draft_engine_dir,
-                                         runtime_mapping,
-                                         debug_mode=debug_mode)
+                                       runtime_mapping,
+                                       debug_mode=debug_mode)
         self._encoder_output = None
         self._encoder_output_lengths = None
         self._encoder_max_input_length = None
@@ -117,22 +137,24 @@ class PersistentWhisperDraftDecoder:
     def reset_session(self):
         self._needs_reset = True
         self._committed_prefix_len = 0
+        self.decoder.rewind_draft_session()
 
     def propose(self, prefix, end_id, draft_len):
         prefix_len = len(prefix[0])
-        if self._needs_reset or prefix_len < self._committed_prefix_len:
+        force_reset = self._needs_reset or prefix_len < self._committed_prefix_len
+        if force_reset:
             self._needs_reset = False
             self._committed_prefix_len = 0
 
         decoder_input_ids = prefix[0].unsqueeze(0).cuda()
-        output_ids = self.decoder.generate(
+        output_ids = self.decoder.propose_draft(
             decoder_input_ids,
             self._encoder_output,
             self._encoder_max_input_length,
             self._encoder_output_lengths,
             end_id,
-            max_new_tokens=draft_len,
-            num_beams=1,
+            draft_len,
+            force_reset=force_reset,
         )
         seq = output_ids[0][0]
         if isinstance(seq, torch.Tensor):

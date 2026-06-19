@@ -37,7 +37,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
     std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
-    std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
+    std::optional<Tensor> encoderOutput, std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
     std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
@@ -48,7 +48,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
         std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::move(logitslogitsPostProcessor),
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
+        std::move(contextPhaseParams), std::move(encoderInputFeatures), std::move(encoderOutput), encoderOutputLength, crossAttentionMask,
         numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
         allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
@@ -219,6 +219,11 @@ std::optional<Tensor> Request::getEncoderInputFeatures() const
     return mImpl->getEncoderInputFeatures();
 }
 
+std::optional<Tensor> Request::getEncoderOutput() const
+{
+    return mImpl->getEncoderOutput();
+}
+
 std::optional<SizeType32> Request::getEncoderOutputLength() const
 {
     return mImpl->getEncoderOutputLength();
@@ -387,6 +392,11 @@ void Request::setContextPhaseParams(ContextPhaseParams contextPhaseParams)
 void Request::setEncoderInputFeatures(Tensor encoderInputFeatures)
 {
     mImpl->setEncoderInputFeatures(encoderInputFeatures);
+}
+
+void Request::setEncoderOutput(Tensor encoderOutput)
+{
+    mImpl->setEncoderOutput(encoderOutput);
 }
 
 void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)

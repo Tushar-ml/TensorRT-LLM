@@ -192,7 +192,7 @@ trtllm-build --checkpoint_dir ${TARGET_CKPT}/encoder --output_dir ${TARGET_ENGIN
 trtllm-build --checkpoint_dir ${TARGET_CKPT}/decoder --output_dir ${TARGET_ENGINE}/decoder \
   --moe_plugin disable --max_batch_size 8 --max_beam_width 1 \
   --max_seq_len 114 --max_input_len 14 --max_encoder_input_len 3000 \
-  --speculative_decoding_mode draft_tokens_external --max_draft_len ${MAX_DRAFT_LEN:-16} \
+  --speculative_decoding_mode draft_tokens_external --max_draft_len ${MAX_DRAFT_LEN:-32} \
   --gemm_plugin float16 --bert_attention_plugin float16 --gpt_attention_plugin float16 \
   --remove_input_padding enable --kv_cache_type paged --use_paged_context_fmha enable
 ```
@@ -204,7 +204,7 @@ python3 run.py --engine_dir ${BASELINE_ENGINE} --input_file ${AUDIO} \
   --assets_dir assets --num_beams 1 --use_py_session
 ```
 
-Run optimized DTM inference (single GPU; build target decoder with `--max_draft_len 16`):
+Run optimized DTM inference (single GPU; defaults: `--draft_backend py --draft_mode hybrid`):
 
 ```bash
 python3 run_dtm.py \
@@ -212,7 +212,6 @@ python3 run_dtm.py \
   --target_engine_dir ${TARGET_ENGINE} \
   --baseline_engine_dir ${BASELINE_ENGINE} \
   --draft_target_model_config="[16,[0],[0],False]" \
-  --draft_mode turbo \
   --input_file /home/ubuntu/audio_60s_30s.wav \
   --assets_dir assets \
   --kv_cache_enable_block_reuse \
@@ -221,13 +220,16 @@ python3 run_dtm.py \
   --profile
 ```
 
+For higher throughput, rebuild the DTM target decoder with `--max_draft_len 32` and set
+`--draft_target_model_config="[32,[0],[0],False]"` (or use `--sweep_draft_len`).
+
 Benchmark turbo vs large-v3 vs optimized DTM (single H100, 30s audio; DTM target decoder built with `--max_draft_len 16`):
 
 | Mode | Wall time | RTF |
 |------|-----------|-----|
 | Turbo | ~0.075s | 0.0025 |
 | Large-v3 | ~0.35s | 0.012 |
-| DTM (`draft_len=16`) | **~0.21s** | **0.007** |
+| DTM (`draft_len=16`, hybrid/py) | **~0.10–0.15s** | **0.003–0.005** |
 
 ```bash
 python3 benchmark_dtm.py \
@@ -242,8 +244,12 @@ Optional draft engine rebuild for tighter single-batch KV pools:
 
 ```bash
 MAX_BATCH=1 bash build_draft_engines.sh
+# DTM target with max_draft_len=32 (recommended for optimized DTM):
+MAX_DRAFT_LEN=32 bash build_dtm_target_engine.sh
 # distil draft experiment:
 # DRAFT_MODEL=distil-large-v3 DRAFT_ENGINE=whisper_distil_draft_engine bash build_draft_engines.sh
+# FP8 draft experiment:
+# PRECISION=float8 DRAFT_ENGINE=whisper_turbo_fp8_draft_engine bash build_draft_engines.sh
 ```
 
 Legacy DTM invocation (full ModelRunnerCpp draft path):
@@ -262,9 +268,9 @@ python3 run_dtm.py \
 Notes:
 - `--draft_target_model_config` is `[draft_len, draft_gpu_ids, target_gpu_ids, use_logits]`.
 - `--draft_len` overrides draft length (default **16** from config; rebuild DTM decoder with `--max_draft_len` ≥ chosen value).
-- `--sweep_draft_len` benchmarks `{4,6,8,10,12,16}`.
-- `--draft_mode` supports `turbo`, `ngram`, or `hybrid` draft proposals.
-- `--draft_backend cpp` (default) keeps ModelRunnerCpp draft quality; `py` uses encoder-once py_session draft.
+- `--sweep_draft_len` benchmarks `{4,6,8,10,12,16,24,32,48}`.
+- `--draft_mode` supports `turbo`, `ngram`, or `hybrid` draft proposals (default **hybrid**).
+- `--draft_backend py` (default) uses encoder-once py_session draft; `cpp` uses ModelRunnerCpp (legacy/slower).
 - `--profile` prints per-iteration draft/target latency.
 - DTM output should match `${BASELINE_ENGINE}` greedy decoding; turbo (`${DRAFT_ENGINE}`) is a different model and may differ in wording.
 - Encoder builds must use `--remove_input_padding enable --kv_cache_type disabled` (TRT-LLM 1.3+ defaults break Whisper encoder otherwise).

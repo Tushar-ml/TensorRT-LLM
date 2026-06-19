@@ -132,9 +132,11 @@ def test_whisper_dtm(llm_venv, engine_dir, whisper_example_root,
         f"--input_file={whisper_example_audio_file}",
         f"--assets_dir={target_ckpt_dir}",
         '--draft_target_model_config=[4,[0],[0],False]',
-        '--draft_mode=turbo',
+        '--draft_mode=hybrid',
+        '--draft_backend=py',
         '--draft_kv_cache_free_gpu_memory_fraction=0.18',
         '--target_kv_cache_free_gpu_memory_fraction=0.28',
+        '--profile',
         "--log_level=info",
     ]
     output = venv_check_call(llm_venv, dtm_cmd)
@@ -147,6 +149,7 @@ def test_whisper_dtm(llm_venv, engine_dir, whisper_example_root,
     assert rtf_match is not None
     rtf = float(rtf_match.group(1))
     assert rtf < 1.0, f"DTM RTF smoke check failed: {rtf}"
+    assert "Profile summary:" in output
     if draft_model_name == target_model_name:
         assert acceptance > 0.0
     else:

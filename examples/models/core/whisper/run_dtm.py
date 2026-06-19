@@ -20,7 +20,7 @@ import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.runtime import ModelRunnerCpp
 
-from run import (WhisperTRTLLM, decode_wav_file, read_config)
+from run import (WhisperEncoding, WhisperTRTLLM, decode_wav_file, read_config)
 
 
 def parse_arguments():
@@ -46,14 +46,14 @@ def parse_arguments():
                         help='Override draft_len from draft_target_model_config (engine max_draft_len must be >= this value).')
     parser.add_argument('--draft_mode',
                         type=str,
-                        default='turbo',
+                        default='hybrid',
                         choices=['turbo', 'ngram', 'hybrid'],
-                        help='Draft source: turbo neural, ngram pool, or hybrid.')
+                        help='Draft source: turbo neural, ngram pool, or hybrid (default).')
     parser.add_argument('--draft_backend',
                         type=str,
-                        default='cpp',
+                        default='py',
                         choices=['cpp', 'py'],
-                        help='Draft runtime: cpp ModelRunnerCpp (default) or py encoder-once session.')
+                        help='Draft runtime: py encoder-once session (default) or cpp ModelRunnerCpp.')
     parser.add_argument('--ngram_max_matching_size',
                         type=int,
                         default=4,
@@ -63,7 +63,7 @@ def parse_arguments():
                         help='Log per-iteration draft/target latency breakdown.')
     parser.add_argument('--sweep_draft_len',
                         action='store_true',
-                        help='Sweep draft_len in {4,6,8,10,12,16} and print benchmark table.')
+                        help='Sweep draft_len in {4,6,8,10,12,16,24,32,48} and print benchmark table.')
     parser.add_argument('--assets_dir', type=str, default='./assets')
     parser.add_argument('--input_file', type=str, required=True)
     parser.add_argument('--padding_strategy',
@@ -136,6 +136,8 @@ def run_whisper_dtm(prefix,
                     max_output_len,
                     mel,
                     mel_input_lengths,
+                    target_encoder_output=None,
+                    target_encoder_output_lengths=None,
                     temperature=0.0,
                     top_k=1,
                     top_p=0.0,
@@ -150,22 +152,38 @@ def run_whisper_dtm(prefix,
 
     n_draft_tokens = 0
     n_accept_tokens = 0
+    n_ngram_hits = 0
     n_iteration = 0
     profiler = IterationProfiler(enabled=profile)
 
-    target_gen_common = dict(
-        encoder_input_features=mel,
-        encoder_output_lengths=(mel_input_lengths // 2).tolist(),
-        end_id=end_id,
-        pad_id=end_id,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        num_beams=1,
-        streaming=False,
-        output_sequence_lengths=True,
-        return_dict=True,
-    )
+    if target_encoder_output is not None:
+        target_gen_common = dict(
+            encoder_outputs=[target_encoder_output],
+            encoder_output_lengths=target_encoder_output_lengths,
+            end_id=end_id,
+            pad_id=end_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            num_beams=1,
+            streaming=False,
+            output_sequence_lengths=True,
+            return_dict=True,
+        )
+    else:
+        target_gen_common = dict(
+            encoder_input_features=mel,
+            encoder_output_lengths=(mel_input_lengths // 2).tolist(),
+            end_id=end_id,
+            pad_id=end_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            num_beams=1,
+            streaming=False,
+            output_sequence_lengths=True,
+            return_dict=True,
+        )
 
     while True:
         n_iteration += 1
@@ -181,6 +199,8 @@ def run_whisper_dtm(prefix,
             d_ids = ngram_pool.get_draft_tokens(prefix)
             d_len = len(d_ids[0])
             used_ngram = d_len > 0 and d_ids[0][0] != end_id
+            if used_ngram:
+                n_ngram_hits += 1
         if draft_mode == 'ngram' or (draft_mode == 'hybrid'
                                      and not used_ngram):
             if draft_decoder is not None:
@@ -230,6 +250,9 @@ def run_whisper_dtm(prefix,
         'accepted_tokens': n_accept_tokens,
         'acceptance_rate':
         (n_accept_tokens / n_draft_tokens if n_draft_tokens > 0 else 0.0),
+        'ngram_hits': n_ngram_hits,
+        'ngram_hit_rate':
+        (n_ngram_hits / n_iteration if n_iteration > 0 else 0.0),
         'profile': profiler.summary(),
     }
     if profile:
@@ -268,9 +291,14 @@ def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
                 kv_cache_free_gpu_memory_fraction=draft_fraction,
                 **common_runner_kwargs,
             )
-            draft_decoder = CppDraftRunner(draft_runner, mel, mel_input_lengths,
-                                           args.temperature, args.top_k,
-                                           args.top_p)
+            draft_decoder = CppDraftRunner(draft_runner,
+                                           mel,
+                                           mel_input_lengths,
+                                           args.temperature,
+                                           args.top_k,
+                                           args.top_p,
+                                           draft_engine_dir=Path(
+                                               args.draft_engine_dir))
 
     target_runner = ModelRunnerCpp.from_dir(
         engine_dir=args.target_engine_dir,
@@ -295,6 +323,12 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         ngram_pool = NgramDraftPool(draft_len, args.ngram_max_matching_size,
                                     end_id)
 
+    target_encoder_output = None
+    target_encoder_output_lengths = None
+    target_encoder = WhisperEncoding(Path(args.target_engine_dir))
+    target_encoder_output, target_encoder_output_lengths = target_encoder.get_audio_features(
+        mel.transpose(1, 2), mel_input_lengths)
+
     start = time.time()
     output_ids, stats = run_whisper_dtm(
         prefix,
@@ -307,6 +341,8 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         args.max_output_len,
         mel,
         mel_input_lengths,
+        target_encoder_output=target_encoder_output,
+        target_encoder_output_lengths=target_encoder_output_lengths.tolist(),
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -374,7 +410,7 @@ def main():
     if args.sweep_draft_len:
         print(f'Sweeping draft_len on {args.input_file} ({duration:.2f}s audio)')
         print(f"{'draft_len':>9} {'iters':>6} {'accept%':>8} {'time':>8} {'RTF':>8}")
-        for sweep_len in [4, 6, 8, 10, 12, 16]:
+        for sweep_len in [4, 6, 8, 10, 12, 16, 24, 32, 48]:
             output_ids, stats = _run_once(args, sweep_len, draft_device_list,
                                           target_device_list, prefix, mel,
                                           mel_input_lengths, duration, end_id)
@@ -398,6 +434,9 @@ def main():
     print(f'Iterations: {stats["iterations"]}')
     print(f'Acceptance rate: {stats["acceptance_rate"] * 100:.2f}% '
           f'({stats["accepted_tokens"]}/{stats["draft_tokens"]} draft tokens)')
+    if stats.get('ngram_hits', 0) > 0 or args.draft_mode in ('ngram', 'hybrid'):
+        print(f'Ngram hit rate: {stats["ngram_hit_rate"] * 100:.2f}% '
+              f'({stats["ngram_hits"]}/{stats["iterations"]} iterations)')
     print(f'RTF: {stats["rtf"]:.4f}')
 
 

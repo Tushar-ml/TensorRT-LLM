@@ -738,6 +738,7 @@ public:
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
+        std::optional<Tensor> encoderOutput = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
@@ -784,6 +785,7 @@ public:
     [[nodiscard]] bool getReturnAllGeneratedTokens() const;
     [[nodiscard]] std::optional<ContextPhaseParams> const& getContextPhaseParams() const;
     [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
+    [[nodiscard]] std::optional<Tensor> getEncoderOutput() const;
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
@@ -822,6 +824,7 @@ public:
     void setRequestType(RequestType const& requestType);
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
+    void setEncoderOutput(Tensor encoderOutput);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);

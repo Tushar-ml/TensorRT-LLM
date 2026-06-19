@@ -30,3 +30,4 @@ trtllm-build --checkpoint_dir "${DRAFT_CKPT}/decoder" \
   --output_dir "${DRAFT_ENGINE}/decoder" "${DECODER_FLAGS[@]}"
 
 echo "Built draft engine at ${DRAFT_ENGINE} (model=${DRAFT_MODEL}, max_batch=${MAX_BATCH}, precision=${PRECISION})"
+echo "Optional: PRECISION=float8 for FP8 draft GEMMs; DRAFT_MODEL=distil-large-v3 for alternate draft."

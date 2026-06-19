@@ -10,9 +10,8 @@ from pathlib import Path
 import torch
 
 from run import read_config
-from run_dtm import _build_runners, _prepare_mel, run_whisper_dtm
+from run_dtm import _prepare_mel, _run_once
 from tokenizer import get_tokenizer
-from whisper_dtm_utils import PersistentWhisperDraftDecoder
 
 from tensorrt_llm.runtime import ModelRunnerCpp
 
@@ -63,39 +62,24 @@ def _bench_cpp(engine_dir, input_file, assets_dir, text_prefix, max_output_len):
     return statistics.mean(times), statistics.pstdev(times), duration
 
 
-def _bench_dtm(args, duration):
-    enc_cfg = read_config('encoder', Path(args.target_engine_dir))
-    tok = get_tokenizer('multilingual',
-                        num_languages=enc_cfg['num_languages'],
-                        tokenizer_dir=args.assets_dir)
-    end_id = tok.encode('<|endoftext|>',
-                        allowed_special=tok.special_tokens_set)[0]
-    pid = tok.encode(args.text_prefix,
-                     allowed_special=tok.special_tokens_set)
-    prefix = [torch.tensor(pid, dtype=torch.int32)]
-    mel, mel_lens, _ = _prepare_mel(args.input_file, enc_cfg['n_mels'],
-                                     args.dtype, args.assets_dir, 'max')
+def _bench_dtm(args, duration, end_id, prefix, mel, mel_lens):
     draft_len, draft_devices, target_devices, _ = eval(
         args.draft_target_model_config)
-    draft_decoder, target_runner = _build_runners(args, draft_devices,
-                                                  target_devices, 0, mel,
-                                                  mel_lens)
-    if isinstance(draft_decoder, PersistentWhisperDraftDecoder):
-        draft_decoder.encode_once(mel.transpose(1, 2), mel_lens)
 
-    def run_once():
-        return run_whisper_dtm(prefix, target_runner, draft_decoder, None,
-                               args.draft_mode, draft_len, end_id,
-                               args.max_output_len, mel, mel_lens)
-
-    run_once()
+    _run_once(args, draft_len, draft_devices, target_devices, prefix, mel,
+              mel_lens, duration, end_id)
     times = []
-    for _ in range(5):
-        t0 = time.time()
-        run_once()
+    last_stats = {}
+    last_profile = {}
+    for i in range(5):
+        args.profile = (i == 4)
+        _, stats = _run_once(args, draft_len, draft_devices, target_devices,
+                             prefix, mel, mel_lens, duration, end_id)
         torch.cuda.synchronize()
-        times.append(time.time() - t0)
-    return statistics.mean(times), statistics.pstdev(times), duration
+        times.append(stats['elapsed'])
+        last_stats = stats
+        last_profile = stats.get('profile') or {}
+    return statistics.mean(times), statistics.pstdev(times), duration, last_stats, last_profile
 
 
 def main():
@@ -106,8 +90,9 @@ def main():
     parser.add_argument('--target_engine_dir', required=True)
     parser.add_argument('--baseline_engine_dir', required=True)
     parser.add_argument('--draft_target_model_config', default='[16,[0],[0],False]')
-    parser.add_argument('--draft_mode', default='turbo')
-    parser.add_argument('--draft_backend', default='cpp')
+    parser.add_argument('--draft_mode', default='hybrid')
+    parser.add_argument('--draft_backend', default='py')
+    parser.add_argument('--ngram_max_matching_size', type=int, default=4)
     parser.add_argument('--kv_cache_enable_block_reuse', action='store_true', default=True)
     parser.add_argument('--draft_kv_cache_free_gpu_memory_fraction', type=float, default=0.18)
     parser.add_argument('--target_kv_cache_free_gpu_memory_fraction', type=float, default=0.28)
@@ -118,18 +103,30 @@ def main():
     parser.add_argument('--text_prefix',
                         default='<|startoftranscript|><|en|><|transcribe|><|notimestamps|>')
     parser.add_argument('--dtype', default='float16')
+    parser.add_argument('--profile', action='store_true', default=False)
     args = parser.parse_args()
+    args.profile = False
 
-    _, _, duration = _prepare_mel(args.input_file, 128, args.dtype,
-                                    args.assets_dir, 'max')
+    enc_cfg = read_config('encoder', Path(args.target_engine_dir))
+    tok = get_tokenizer('multilingual',
+                        num_languages=enc_cfg['num_languages'],
+                        tokenizer_dir=args.assets_dir)
+    end_id = tok.encode('<|endoftext|>',
+                        allowed_special=tok.special_tokens_set)[0]
+    pid = tok.encode(args.text_prefix, allowed_special=tok.special_tokens_set)
+    prefix = [torch.tensor(pid, dtype=torch.int32)]
+    mel, mel_lens, duration = _prepare_mel(args.input_file, enc_cfg['n_mels'],
+                                             args.dtype, args.assets_dir, 'max')
+
     turbo_mean, turbo_std, _ = _bench_cpp(args.draft_engine_dir,
-                                           args.input_file, args.assets_dir,
-                                           args.text_prefix,
-                                           args.max_output_len)
+                                            args.input_file, args.assets_dir,
+                                            args.text_prefix,
+                                            args.max_output_len)
     v3_mean, v3_std, _ = _bench_cpp(args.baseline_engine_dir, args.input_file,
                                     args.assets_dir, args.text_prefix,
                                     args.max_output_len)
-    dtm_mean, dtm_std, _ = _bench_dtm(args, duration)
+    dtm_mean, dtm_std, _, dtm_stats, profile = _bench_dtm(
+        args, duration, end_id, prefix, mel, mel_lens)
 
     print(f'Audio duration: {duration:.2f}s')
     print(f"{'Mode':<22} {'Time':>12} {'RTF':>10} {'vs turbo':>10}")
@@ -141,6 +138,16 @@ def main():
     ]:
         print(f'{label:<22} {mean:6.3f}s±{std:.3f} {mean / duration:8.4f} '
               f'{turbo_mean / mean:9.2f}x')
+
+    print('-' * 58)
+    print(f"DTM iterations: {dtm_stats['iterations']}")
+    print(f"DTM acceptance: {dtm_stats['acceptance_rate'] * 100:.1f}%")
+    print(f"DTM ngram hit rate: {dtm_stats.get('ngram_hit_rate', 0) * 100:.1f}%")
+    if profile:
+        print(f"DTM draft avg ms/iter: {profile.get('draft_ms_avg', 0):.2f}")
+        print(f"DTM target avg ms/iter: {profile.get('target_ms_avg', 0):.2f}")
+    if dtm_mean >= v3_mean:
+        print('WARNING: optimized DTM did not beat large-v3 baseline wall time')
 
 
 if __name__ == '__main__':

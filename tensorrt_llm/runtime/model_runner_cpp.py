@@ -545,6 +545,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             encoder_input_ids: List[torch.Tensor] = None,
             encoder_input_features: List[
                 torch.Tensor] = None,  # TODO: add to doc string
+            encoder_outputs: List[torch.Tensor] = None,
             encoder_output_lengths: List[int] = None,
             cross_attention_masks: List[
                 torch.Tensor] = None,  # TODO: add to doc string
@@ -586,6 +587,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 A list of encoder input id tensors for encoder-decoder models (optional). Each tensor is of shape (sequence_length, ).
             encoder_input_features: (List[torch.Tensor]):
                 A list of encoder input feature tensors for multimodal encoder-decoder models (optional). Each tensor is of shape (sequence_length, feature_dim).
+            encoder_outputs: (List[torch.Tensor]):
+                Precomputed encoder hidden states (optional). Mutually exclusive with encoder_input_features.
             encoder_output_lengths: (List[int]):
                 A list of encoder output lengths (optional) if encoder output has different length from encoder input (due to convolution down-sampling, etc.)
             sampling_config (SamplingConfig):
@@ -631,6 +634,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         # If we are in a multi-gpu scenario, only rank 0 continues
         if not self.session.can_enqueue_requests():
             return []
+
+        if encoder_input_features is not None and encoder_outputs is not None:
+            raise RuntimeError(
+                'encoder_input_features and encoder_outputs are mutually exclusive.'
+            )
 
         # Convert tensor input to plain lists
         batch_input_ids_list = [a.tolist() for a in batch_input_ids]
@@ -768,6 +776,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 if encoder_output_lengths is not None else None,
                 encoder_input_features=encoder_input_features[i].contiguous()
                 if encoder_input_features is not None else None,
+                encoder_output=encoder_outputs[i].contiguous()
+                if encoder_outputs is not None else None,
                 position_ids=position_ids[i].tolist()
                 if position_ids is not None else None,
                 cross_attention_mask=cross_attention_masks[i].contiguous() if

@@ -58,8 +58,9 @@ public:
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
         std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
-        PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
-        std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
+        PriorityType priority, RequestType type,         std::optional<ContextPhaseParams> contextPhaseParams,
+        std::optional<Tensor> encoderInputFeatures, std::optional<Tensor> encoderOutput,
+        std::optional<SizeType32> encoderOutputLength,
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
@@ -92,6 +93,7 @@ public:
         , mType(type)
         , mContextPhaseParams(std::move(contextPhaseParams))
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
+        , mEncoderOutput(std::move(encoderOutput))
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
         , mNumReturnSequences(numReturnSequences)
@@ -275,6 +277,11 @@ public:
         return mEncoderInputFeatures;
     }
 
+    [[nodiscard]] std::optional<Tensor> getEncoderOutput() const
+    {
+        return mEncoderOutput;
+    }
+
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const
     {
         return mCrossAttentionMask;
@@ -453,6 +460,11 @@ public:
         mEncoderInputFeatures = encoderInputFeatures;
     }
 
+    void setEncoderOutput(Tensor encoderOutput)
+    {
+        mEncoderOutput = encoderOutput;
+    }
+
     void setCrossAttentionMask(Tensor crossAttentionMask)
     {
         mCrossAttentionMask = crossAttentionMask;
@@ -512,6 +524,8 @@ private:
     {
         TLLM_CHECK(!mInputTokenIds.empty());
         TLLM_CHECK(mMaxNewTokens > 0);
+        TLLM_CHECK_WITH_INFO(!(mEncoderInputFeatures.has_value() && mEncoderOutput.has_value()),
+            "encoder_input_features and encoder_output are mutually exclusive");
 
         // Show warning message unless mNumReturnSequences is the default value.
         if (mNumReturnSequences > 1)
@@ -572,6 +586,7 @@ private:
         lambda(mType);
         lambda(mContextPhaseParams);
         lambda(mEncoderInputFeatures);
+        lambda(mEncoderOutput);
         lambda(mEncoderOutputLength);
         lambda(mCrossAttentionMask);
         lambda(mNumReturnSequences);
@@ -612,6 +627,7 @@ private:
     RequestType mType;
     std::optional<ContextPhaseParams> mContextPhaseParams;
     std::optional<Tensor> mEncoderInputFeatures;
+    std::optional<Tensor> mEncoderOutput;
     std::optional<SizeType32> mEncoderOutputLength;
     std::optional<Tensor> mCrossAttentionMask;
     SizeType32 mNumReturnSequences;
