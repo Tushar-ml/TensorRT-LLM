@@ -1224,6 +1224,15 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_decoder_input_len"] = build_config.max_input_len
             prepare_input_args[
                 "max_encoder_input_len"] = build_config.max_encoder_input_len
+            if build_config.speculative_decoding_mode == SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL:
+                if not build_config.plugin_config.use_paged_context_fmha:
+                    logger.warning(
+                        "Paged Context FMHA is required for encoder-decoder "
+                        "external draft speculative decoding. Turning it on")
+                    build_config.plugin_config.use_paged_context_fmha = True
+                assert build_config.max_draft_len > 0, (
+                    "max_draft_len must be > 0 when speculative_decoding_mode "
+                    "is draft_tokens_external for DecoderModel")
 
         if model.config.architecture == "WhisperEncoder":
 
