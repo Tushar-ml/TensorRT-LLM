@@ -138,6 +138,77 @@ def _count_accepted(d_ids, t_ids):
     return accepted
 
 
+def _group_indices_by_prefix_len(prefix):
+    groups = {}
+    for bi, p in enumerate(prefix):
+        plen = len(p)
+        groups.setdefault(plen, []).append(bi)
+    return groups
+
+
+def _subset_target_gen_common(target_gen_common, indices):
+    slot_gen = dict(target_gen_common)
+    if isinstance(target_gen_common.get('encoder_outputs'), list):
+        slot_gen['encoder_outputs'] = [
+            target_gen_common['encoder_outputs'][i] for i in indices
+        ]
+        enc_lens = target_gen_common['encoder_output_lengths']
+        if isinstance(enc_lens, list):
+            slot_gen['encoder_output_lengths'] = [enc_lens[i] for i in indices]
+        else:
+            slot_gen['encoder_output_lengths'] = [
+                int(enc_lens[i]) for i in indices
+            ]
+    return slot_gen
+
+
+def _merge_target_outputs(batch_size, indices, slot_out, output_ids_parts,
+                          seq_lens_parts):
+    for local_i, bi in enumerate(indices):
+        output_ids_parts[bi] = slot_out['output_ids'][local_i:local_i + 1]
+        seq_lens_parts[bi] = slot_out['sequence_lengths'][local_i:local_i + 1]
+
+
+def _batched_target_verify(target_runner, prefix, draft_tokens_list, draft_len,
+                           target_gen_common, batched_target_verify):
+    batch_size = len(prefix)
+    output_ids_parts = [None] * batch_size
+    seq_lens_parts = [None] * batch_size
+    groups = _group_indices_by_prefix_len(prefix)
+
+    for _plen, indices in groups.items():
+        sub_prefix = [prefix[i] for i in indices]
+        sub_drafts = [draft_tokens_list[i] for i in indices]
+        slot_gen = _subset_target_gen_common(target_gen_common, indices)
+        if len(indices) == 1 or not batched_target_verify:
+            for bi, p, d in zip(indices, sub_prefix, sub_drafts):
+                one_gen = _subset_target_gen_common(target_gen_common, [bi])
+                slot_out = target_runner.generate(
+                    batch_input_ids=[p],
+                    draft_tokens_list=[d],
+                    draft_logits_list=None,
+                    max_new_tokens=draft_len + 1,
+                    **one_gen,
+                )
+                _merge_target_outputs(batch_size, [bi], slot_out,
+                                      output_ids_parts, seq_lens_parts)
+        else:
+            slot_out = target_runner.generate(
+                batch_input_ids=sub_prefix,
+                draft_tokens_list=sub_drafts,
+                draft_logits_list=None,
+                max_new_tokens=draft_len + 1,
+                **slot_gen,
+            )
+            _merge_target_outputs(batch_size, indices, slot_out,
+                                  output_ids_parts, seq_lens_parts)
+
+    return {
+        'output_ids': torch.cat(output_ids_parts, dim=0),
+        'sequence_lengths': torch.cat(seq_lens_parts, dim=0),
+    }
+
+
 def _split_encoder_outputs(encoder_output, batch_size, encoder_output_lengths=None):
     if batch_size == 1:
         return [encoder_output]
@@ -160,19 +231,47 @@ def _resolve_batched_target_verify(args, batch_size):
     return batch_size > 1
 
 
-def _encode_target_for_batch(target_engine_dir, mel, mel_input_lengths,
-                             batch_size):
-    """Encode audio once and replicate encoder features for batch slots."""
+def _prepare_batch_mels(input_files, n_mels, dtype, assets_dir,
+                        padding_strategy='max'):
+    """Load and stack mel features for a multi-audio batch."""
+    mels = []
+    lengths = []
+    durations = []
+    for input_file in input_files:
+        mel, mel_lens, duration = _prepare_mel(input_file, n_mels, dtype,
+                                               assets_dir, padding_strategy)
+        mels.append(mel)
+        lengths.append(mel_lens)
+        durations.append(duration)
+    return torch.cat(mels, dim=0), torch.cat(lengths, dim=0), durations
+
+
+def _encode_target_for_batch(target_engine_dir,
+                             mel,
+                             mel_input_lengths,
+                             batch_size,
+                             identical_batch=True):
+    """Encode target audio; replicate bs=1 features for identical batch slots."""
     target_encoder = WhisperEncoding(Path(target_engine_dir))
-    single_mel = mel[:1] if mel.shape[0] > 1 else mel
-    single_lens = (mel_input_lengths[:1]
-                   if mel_input_lengths.shape[0] > 1 else mel_input_lengths)
+    if identical_batch and batch_size > 1:
+        single_mel = mel[:1]
+        single_lens = mel_input_lengths[:1]
+        encoder_output, encoder_output_lengths = target_encoder.get_audio_features(
+            single_mel.transpose(1, 2), single_lens)
+        encoder_outputs, encoder_lengths = replicate_encoder_for_batch(
+            encoder_output, encoder_output_lengths, batch_size)
+        encoder_max_input_length = max(encoder_lengths)
+        return encoder_outputs, encoder_lengths, encoder_max_input_length
+
     encoder_output, encoder_output_lengths = target_encoder.get_audio_features(
-        single_mel.transpose(1, 2), single_lens)
-    encoder_outputs, encoder_lengths = replicate_encoder_for_batch(
-        encoder_output, encoder_output_lengths, batch_size)
-    encoder_max_input_length = max(encoder_lengths)
-    return encoder_outputs, encoder_lengths, encoder_max_input_length
+        mel.transpose(1, 2), mel_input_lengths)
+    if batch_size == 1:
+        enc_len = int(encoder_output_lengths[0])
+        return [encoder_output], [enc_len], enc_len
+    encoder_outputs = _split_encoder_outputs(encoder_output, batch_size,
+                                             encoder_output_lengths.tolist())
+    encoder_lengths = [int(x) for x in encoder_output_lengths.tolist()]
+    return encoder_outputs, encoder_lengths, max(encoder_lengths)
 
 
 def run_whisper_dtm(prefix,
@@ -193,7 +292,8 @@ def run_whisper_dtm(prefix,
                     profile=False,
                     sync_identical_batch=False,
                     batched_target_verify=False,
-                    encoder_max_input_length=None):
+                    encoder_max_input_length=None,
+                    identical_batch=True):
     batch_size = len(prefix)
     input_len = len(prefix[0])
     max_seq_len = input_len + max_output_len
@@ -240,72 +340,42 @@ def run_whisper_dtm(prefix,
 
     while True:
         n_iteration += 1
-        prefix_len = len(prefix[0])
-        if any(len(p) != prefix_len for p in prefix):
-            raise RuntimeError(
-                'Batched DTM requires equal prefix lengths across batch items.')
-        if prefix_len >= max_seq_len - 1:
+        if all(len(p) >= max_seq_len - 1 for p in prefix):
             break
 
         draft_t0 = time.time()
         draft_tokens_list = [[end_id] for _ in range(batch_size)]
         d_len = 0
-        used_ngram = False
+        turbo_indices = list(range(batch_size))
         if draft_mode in ('ngram', 'hybrid') and ngram_pool is not None:
-            ngram_draft = ngram_pool.get_draft_tokens(prefix)[0]
-            d_len = len(ngram_draft)
-            used_ngram = d_len > 0 and ngram_draft[0] != end_id
-            if used_ngram:
-                n_ngram_hits += 1
-                draft_tokens_list = [ngram_draft[:] for _ in range(batch_size)]
-        if draft_mode == 'ngram' or (draft_mode == 'hybrid'
-                                     and not used_ngram):
-            if draft_decoder is not None:
-                draft_tokens_list, d_len = draft_decoder.propose(
-                    prefix, end_id, draft_len)
-        elif draft_mode == 'turbo' and draft_decoder is not None:
-            draft_tokens_list, d_len = draft_decoder.propose(
-                prefix, end_id, draft_len)
+            for bi in range(batch_size):
+                ngram_draft = ngram_pool.get_draft_tokens([prefix[bi]])[0]
+                if len(ngram_draft) > 0 and ngram_draft[0] != end_id:
+                    n_ngram_hits += 1
+                    draft_tokens_list[bi] = ngram_draft[:]
+                    d_len = max(d_len, len(ngram_draft))
+                    if draft_mode == 'ngram':
+                        turbo_indices = []
+                    elif bi in turbo_indices:
+                        turbo_indices.remove(bi)
+        if draft_decoder is not None and draft_mode in ('turbo', 'hybrid'):
+            turbo_drafts, td = draft_decoder.propose(
+                prefix, end_id, draft_len, identical_batch=identical_batch)
+            for bi in range(batch_size):
+                if draft_mode == 'turbo' or bi in turbo_indices:
+                    draft_tokens_list[bi] = turbo_drafts[bi]
+            d_len = max(d_len, td)
         draft_ms = (time.time() - draft_t0) * 1000.0
 
-        enc_len = encoder_max_input_length
-        if enc_len is None and target_encoder_output_lengths is not None:
-            enc_len = max(int(x) for x in target_encoder_output_lengths)
-
         target_t0 = time.time()
-        if batch_size == 1 or batched_target_verify:
-            target = target_runner.generate(
-                batch_input_ids=prefix,
-                draft_tokens_list=draft_tokens_list,
-                draft_logits_list=None,
-                max_new_tokens=draft_len + 1,
-                **target_gen_common,
-            )
-        else:
-            merged_output_ids = []
-            merged_seq_lens = []
-            for bi in range(batch_size):
-                slot_gen = dict(target_gen_common)
-                if isinstance(target_gen_common.get('encoder_outputs'), list):
-                    slot_gen['encoder_outputs'] = [
-                        target_gen_common['encoder_outputs'][bi]
-                    ]
-                    slot_gen['encoder_output_lengths'] = [
-                        target_gen_common['encoder_output_lengths'][bi]
-                    ]
-                slot_out = target_runner.generate(
-                    batch_input_ids=[prefix[bi]],
-                    draft_tokens_list=[draft_tokens_list[bi]],
-                    draft_logits_list=None,
-                    max_new_tokens=draft_len + 1,
-                    **slot_gen,
-                )
-                merged_output_ids.append(slot_out['output_ids'])
-                merged_seq_lens.append(slot_out['sequence_lengths'])
-            target = {
-                'output_ids': torch.cat(merged_output_ids, dim=0),
-                'sequence_lengths': torch.cat(merged_seq_lens, dim=0),
-            }
+        target = _batched_target_verify(
+            target_runner,
+            prefix,
+            draft_tokens_list,
+            draft_len,
+            target_gen_common,
+            batched_target_verify=(batch_size == 1 or batched_target_verify),
+        )
         torch.cuda.synchronize()
         target_ms = (time.time() - target_t0) * 1000.0
 
@@ -313,9 +383,12 @@ def run_whisper_dtm(prefix,
         batch_draft_count = 0
         new_prefix = []
         all_done = True
+        mean_prefix_len = 0
         for bi in range(batch_size):
+            prefix_len = len(prefix[bi])
+            mean_prefix_len += prefix_len
             t_seq_len = target['sequence_lengths'][bi, 0].item()
-            t_seq_len = min(t_seq_len, max_seq_len)
+            t_seq_len = min(t_seq_len, input_len + max_output_len)
             t_ids = target['output_ids'][bi, 0, prefix_len:t_seq_len].tolist()
             accepted = _count_accepted([draft_tokens_list[bi]], t_ids)
             batch_accepted += accepted
@@ -335,12 +408,13 @@ def run_whisper_dtm(prefix,
             all_done = False
 
         prefix = new_prefix
+        mean_prefix_len = mean_prefix_len // batch_size
         if sync_identical_batch and batch_size > 1:
             leader = prefix[0].clone()
             prefix = [leader.clone() for _ in range(batch_size)]
         n_draft_tokens += batch_draft_count
         n_accept_tokens += batch_accepted
-        profiler.record(n_iteration, prefix_len, draft_ms, target_ms,
+        profiler.record(n_iteration, mean_prefix_len, draft_ms, target_ms,
                         batch_accepted, batch_draft_count)
 
         if all_done:
@@ -370,7 +444,7 @@ def _scaled_kv_fractions(batch_size, draft_fraction, target_fraction):
 
 
 def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
-                   mel, mel_input_lengths, batch_size=1):
+                   mel, mel_input_lengths, batch_size=1, identical_batch=True):
     shared_fraction = getattr(args, 'kv_cache_free_gpu_memory_fraction', None)
     draft_fraction = shared_fraction if shared_fraction is not None else args.draft_kv_cache_free_gpu_memory_fraction
     target_fraction = shared_fraction if shared_fraction is not None else args.target_kv_cache_free_gpu_memory_fraction
@@ -414,7 +488,8 @@ def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
                                            args.top_p,
                                            draft_engine_dir=Path(
                                                args.draft_engine_dir),
-                                           batch_size=batch_size)
+                                           batch_size=batch_size,
+                                           identical_batch=identical_batch)
 
     target_runner = ModelRunnerCpp.from_dir(
         engine_dir=args.target_engine_dir,
@@ -437,18 +512,21 @@ class DTMSession:
     """Reusable DTM runners and target encoder cache for repeated runs."""
 
     def __init__(self, args, draft_device_list, target_device_list, prefix,
-                 mel, mel_input_lengths, batch_size=1):
+                 mel, mel_input_lengths, batch_size=1, identical_batch=True):
         self.args = args
         self.draft_len_cfg = None
         self.draft_device_list = draft_device_list
         self.target_device_list = target_device_list
         self.batch_size = batch_size
+        self.identical_batch = identical_batch
         self.duration = None
         self.end_id = None
 
-        if batch_size > 1:
+        if batch_size > 1 and identical_batch:
             mel = mel.repeat(batch_size, 1, 1)
             mel_input_lengths = mel_input_lengths.repeat(batch_size)
+            prefix = [prefix[0].clone() for _ in range(batch_size)]
+        elif batch_size > 1:
             prefix = [prefix[0].clone() for _ in range(batch_size)]
 
         self.prefix = prefix
@@ -458,10 +536,17 @@ class DTMSession:
         runtime_rank = tensorrt_llm.mpi_rank()
         self.draft_decoder, self.target_runner = _build_runners(
             args, draft_device_list, target_device_list, runtime_rank, mel,
-            mel_input_lengths, batch_size=batch_size)
+            mel_input_lengths, batch_size=batch_size,
+            identical_batch=self.identical_batch)
         if isinstance(self.draft_decoder, PersistentWhisperDraftDecoder):
-            self.draft_decoder.encode_once(self.mel[:1].transpose(1, 2),
-                                           self.mel_input_lengths[:1])
+            if self.identical_batch:
+                self.draft_decoder.encode_once(self.mel[:1].transpose(1, 2),
+                                               self.mel_input_lengths[:1],
+                                               identical_batch=True)
+            else:
+                self.draft_decoder.encode_once(self.mel.transpose(1, 2),
+                                               self.mel_input_lengths,
+                                               identical_batch=False)
 
         self.ngram_pool = None
         self.encoder_max_input_length = None
@@ -472,7 +557,8 @@ class DTMSession:
     def _encode_target_once(self):
         self.encoder_outputs, self.encoder_output_lengths, self.encoder_max_input_length = (
             _encode_target_for_batch(self.args.target_engine_dir, self.mel,
-                                     self.mel_input_lengths, self.batch_size))
+                                     self.mel_input_lengths, self.batch_size,
+                                     identical_batch=self.identical_batch))
 
     def setup_ngram_pool(self, draft_len, end_id):
         if self.args.draft_mode in ('ngram', 'hybrid'):
@@ -508,12 +594,16 @@ class DTMSession:
             sync_identical_batch=sync_identical_batch,
             batched_target_verify=batched_target_verify,
             encoder_max_input_length=self.encoder_max_input_length,
+            identical_batch=self.identical_batch,
         )
         elapsed = time.time() - start
         stats['elapsed'] = elapsed
         stats['elapsed_per_seq'] = elapsed / self.batch_size
-        stats['rtf'] = elapsed / (self.duration * self.batch_size)
-        stats['rtf_per_seq'] = stats['elapsed_per_seq'] / self.duration
+        mean_duration = self.duration
+        if getattr(self, 'durations', None):
+            mean_duration = sum(self.durations) / len(self.durations)
+        stats['rtf'] = elapsed / (mean_duration * self.batch_size)
+        stats['rtf_per_seq'] = stats['elapsed_per_seq'] / mean_duration
         return output_ids, stats
 
 
