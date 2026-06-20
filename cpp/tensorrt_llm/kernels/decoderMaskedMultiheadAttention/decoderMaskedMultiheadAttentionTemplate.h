@@ -1482,11 +1482,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     unsigned const c_tile{MULTI_BLOCK_FLAG ? blockIdx.z : 0};
 
     // Indicate if we need to compute the K/V cache element (add KV bias, IA3, RoPE, etc.) and update the cache.
-    // For Self-Attention, it's always required.
+    // For Self-Attention, it's always required unless skip_kv_cache_update (Q-only KV sharing).
     // For Cross-Attention, as everything is pre-computed,
     // in the context phase of the encoder, it's not needed in that kernel.
-    // Therefore, HANDLE_KV is !DO_CROSS_ATTENTION and irrelevant of timestep.
-    static constexpr bool HANDLE_KV{!DO_CROSS_ATTENTION};
+    bool const handle_kv = !DO_CROSS_ATTENTION && !params.skip_kv_cache_update;
 
     // While doing the product Q*K^T for the different keys we track the max.
     float qk_max = -FLT_MAX;
@@ -1616,6 +1615,22 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&k_cache[inBlockIdx]));
             }
         }
+        else if (params.skip_kv_cache_update)
+        {
+            // Q-only KV sharing: current-timestep K was written by the backbone/target layer.
+            auto const k_idx = QK_VEC_SIZE * tidx;
+            int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
+            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
+
+            if constexpr (ENABLE_8BITS_K_CACHE)
+            {
+                load_8bits_kv_cache_vec(&k, k_cache, inBlockIdx, k_scale_quant_orig_f);
+            }
+            else
+            {
+                k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&k_cache[inBlockIdx]));
+            }
+        }
         else
         {
             // Key
@@ -1647,7 +1662,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             q_bias
                 = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&params.q_bias[q_bias_offset]));
         }
-        if (HANDLE_KV && params.k_bias != nullptr)
+        if (handle_kv && params.k_bias != nullptr)
         {
             auto const k_bias_offset = tensorrt_llm::common::flat_index2(hi_kv, qk_vec_idx, Dh);
             k_bias
@@ -1657,7 +1672,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // Computes the Q/K values with bias.
     q = add(q, q_bias);
-    if (HANDLE_KV)
+    if (handle_kv)
     {
         k = add(k, k_bias);
     }
@@ -1667,7 +1682,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // The batch idx.
     int const batch_idx = batch_beam_idx / beam_width;
     // Do we apply IA3?
-    bool const do_ia3 = HANDLE_KV && params.ia3_tasks != nullptr;
+    bool const do_ia3 = handle_kv && params.ia3_tasks != nullptr;
     // Compute the IA3 task. One per batch index.
     auto const ia3_ti_hi = do_ia3
         ? tensorrt_llm::common::flat_index2(static_cast<unsigned>(params.ia3_tasks[batch_idx]), hi, num_heads)
@@ -1693,7 +1708,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     }
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        if (HANDLE_KV)
+        if (handle_kv)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
                 rotary_embedding_scale, tlength, rotary_embedding_inv_freq_cache);
@@ -1730,7 +1745,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (do_rotary)
         {
             *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx) = q;
-            if (HANDLE_KV)
+            if (handle_kv)
             {
                 *reinterpret_cast<Qk_vec_k*>(k_smem_ + half_idx * smem_pitch + intra_half_idx) = k;
             }
@@ -1753,7 +1768,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             }
 
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
-            if (HANDLE_KV)
+            if (handle_kv)
             {
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
@@ -1779,7 +1794,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (do_rotary)
         {
             q = *reinterpret_cast<Qk_vec_k*>(q_smem_ + half_idx * smem_pitch + intra_half_idx);
-            if (HANDLE_KV)
+            if (handle_kv)
             {
                 k = *reinterpret_cast<Qk_vec_k*>(k_smem_ + half_idx * smem_pitch + intra_half_idx);
             }
@@ -1790,7 +1805,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     }
     }
 
-    // For the same reason as HANDLE_KV, no compute needed in Cross-Attention's 1st step
+    // For the same reason as handle_kv, no compute needed in Cross-Attention's 1st step
     // Store Q K vectors to shared memory, and calculate QK.
     if (qk_vec_idx < Dh_MAX)
     {
@@ -2210,7 +2225,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // Get the c_tile_id that handles the current timestep.
     int current_step_ctile_idx = kv_loop_length / timesteps_per_block;
-    if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && is_valid_qk_vec
+    if (handle_kv && hi == (hi_kv * qhead_per_kv) && is_valid_qk_vec
         && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx))
     {
         // Trigger the stores to global memory.
@@ -2338,7 +2353,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     V_vec_k v_bias;
     zero(v_bias);
     // if( vo == params.timestep % V_PER_ITER ) {
-    if (is_valid_vi && HANDLE_KV && vo == kv_loop_length % V_PER_ITER)
+    if (is_valid_vi && handle_kv && vo == kv_loop_length % V_PER_ITER)
     {
         // Trigger the loads from the V bias buffer.
         if (params.v_bias != nullptr)
@@ -2473,7 +2488,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             }
         }
 
-        if (HANDLE_KV)
+        if (handle_kv)
         {
             // Compute the V values with bias.
             v = add(v, v_bias);

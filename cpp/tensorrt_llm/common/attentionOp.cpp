@@ -129,6 +129,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    bool skip_kv_cache_update = false;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -622,8 +623,20 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
     // Set the input buffers.
     params.q = reinterpret_cast<DataType const*>(input_params.qkv_buf);
-    params.k = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units;
-    params.v = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
+    params.skip_kv_cache_update = input_params.skip_kv_cache_update;
+    if (input_params.skip_kv_cache_update)
+    {
+        // Q-only input: do not index past the Q region.
+        params.stride = hidden_units;
+        params.k = nullptr;
+        params.v = nullptr;
+    }
+    else
+    {
+        params.k = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units;
+        params.v = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
+        params.stride = hidden_units + 2 * hidden_units_kv;
+    }
 
     params.int8_kv_cache = input_params.kv_cache_quant_mode.hasInt8KvCache();
     params.fp8_kv_cache = input_params.kv_cache_quant_mode.hasFp8KvCache();
@@ -633,7 +646,6 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.kv_scale_quant_orig = input_params.kv_scale_quant_orig;
     }
 
-    params.stride = hidden_units + 2 * hidden_units_kv;
     params.finished = const_cast<bool*>(input_params.finished);
 
     params.cache_indir = input_params.cache_indir;
@@ -2661,6 +2673,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
+    dispatch_params.skip_kv_cache_update = params.skip_kv_cache_update;
 
     using DataType = typename SATypeConverter<T>::Type;
     {

@@ -356,6 +356,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             preprocessingParams.position_shift_enabled = xqaParams.position_shift_enabled;
             preprocessingParams.cache_type = cacheType;
             preprocessingParams.separate_q_kv_output = true;
+            preprocessingParams.skip_kv_cache_update = xqaParams.skip_kv_cache_update;
             preprocessingParams.quantized_fp8_output = false;
             preprocessingParams.generation_phase = true;
             preprocessingParams.multi_processor_count = multiprocessorCount;
