@@ -3,9 +3,9 @@
 set -euo pipefail
 
 TARGET_CKPT="${TARGET_CKPT:-whisper_large_v3_weights}"
-TARGET_ENGINE="${TARGET_ENGINE:-whisper_large_v3_dtm_engine}"
-MAX_DRAFT_LEN="${MAX_DRAFT_LEN:-32}"
-MAX_BATCH="${MAX_BATCH:-1}"
+MAX_DRAFT_LEN="${MAX_DRAFT_LEN:-16}"
+MAX_BATCH="${MAX_BATCH:-8}"
+TARGET_ENGINE="${TARGET_ENGINE:-whisper_large_v3_dtm_bs8_engine}"
 # Decoder context must fit prompt prefix + draft tokens in one spec-dec verify step.
 MAX_DECODER_INPUT_LEN="${MAX_DECODER_INPUT_LEN:-$((14 + MAX_DRAFT_LEN))}"
 
@@ -23,4 +23,4 @@ trtllm-build --checkpoint_dir "${TARGET_CKPT}/decoder" \
   --gemm_plugin float16 --bert_attention_plugin float16 --gpt_attention_plugin float16 \
   --remove_input_padding enable --kv_cache_type paged --use_paged_context_fmha enable
 
-echo "Built DTM target at ${TARGET_ENGINE} (max_draft_len=${MAX_DRAFT_LEN})"
+echo "Built DTM target at ${TARGET_ENGINE} (max_batch=${MAX_BATCH}, max_draft_len=${MAX_DRAFT_LEN})"

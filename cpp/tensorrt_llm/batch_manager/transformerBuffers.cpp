@@ -546,13 +546,23 @@ void TransformerBuffers::copyCrossAttentionMasks(RequestVector const& contextReq
             }
             else
             {
-                TLLM_LOG_DEBUG("CrossAttentionMask tensor is on GPU.");
+                TLLM_LOG_DEBUG("CrossAttentionMask tensor is on GPU, staging via pinned host.");
+                auto const* gpuMaskPtr = bufferCastOrNull<bool>(crossAttentionMaskRequest);
+                auto const copiedPosition
+                    = std::min(crossAttentionMaskRequestDim0 - 1, static_cast<SizeType64>(position));
+                auto const copiedSize
+                    = std::min(crossAttentionMaskRequestDim0 - copiedPosition, static_cast<SizeType64>(size));
+                SizeType64 inputMaskOffset = (copiedPosition * crossAttentionMaskRequestDim1);
+                SizeType64 inputMaskSize = (copiedSize * crossAttentionMaskRequestDim1);
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(pinnedMemPtr, gpuMaskPtr + inputMaskOffset,
+                    inputMaskSize * sizeof(bool), cudaMemcpyDeviceToHost, stream.get()));
+                pinnedMemPtr += inputMaskSize;
                 for (SizeType32 tokenId = position; tokenId < position + size; tokenId++)
                 {
+                    SizeType64 tokenIdInPinnedMem
+                        = std::min(copiedSize - 1, static_cast<SizeType64>(tokenId - position));
                     batchedCopySrcOffsets.begin()[numCopiedTokens]
-                        = static_cast<SizeType64>(bufferCastOrNull<bool>(crossAttentionMaskRequest) - primarySrcPtr)
-                        + std::min(crossAttentionMaskRequestDim0 - 1, static_cast<SizeType64>(tokenId))
-                            * crossAttentionMaskRequestDim1;
+                        = (pinnedMemPtr - primarySrcPtr) + tokenIdInPinnedMem * crossAttentionMaskRequestDim1;
                     batchedCopyDstOffsets.begin()[numCopiedTokens]
                         = numTokens * static_cast<SizeType64>(maxEncoderInputLengthInBatch);
                     batchedCopySizes.begin()[numCopiedTokens] = crossAttentionMaskRequestDim1;
@@ -610,11 +620,16 @@ void TransformerBuffers::copyCrossAttentionMasks(RequestVector const& contextReq
             }
             else
             {
-                TLLM_LOG_DEBUG("CrossAttentionMask tensor is on GPU.");
-                batchedCopySrcOffsets.begin()[numCopiedTokens]
-                    = static_cast<SizeType64>(bufferCastOrNull<bool>(crossAttentionMaskRequest) - primarySrcPtr)
-                    + std::min(crossAttentionMaskRequestDim0 - 1, static_cast<SizeType64>(promptLen + decodingIter - 1))
-                        * crossAttentionMaskRequestDim1;
+                TLLM_LOG_DEBUG("CrossAttentionMask tensor is on GPU, staging via pinned host.");
+                auto const* gpuMaskPtr = bufferCastOrNull<bool>(crossAttentionMaskRequest);
+                SizeType64 copiedPosition = std::min(
+                    crossAttentionMaskRequestDim0 - 1, static_cast<SizeType64>(promptLen + decodingIter - 1));
+                SizeType64 inputMaskOffset = (copiedPosition * crossAttentionMaskRequestDim1);
+                SizeType64 inputMaskSize = crossAttentionMaskRequestDim1;
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(pinnedMemPtr, gpuMaskPtr + inputMaskOffset,
+                    inputMaskSize * sizeof(bool), cudaMemcpyDeviceToHost, stream.get()));
+                pinnedMemPtr += inputMaskSize;
+                batchedCopySrcOffsets.begin()[numCopiedTokens] = static_cast<SizeType64>(pinnedMemPtr - primarySrcPtr);
                 batchedCopyDstOffsets.begin()[numCopiedTokens]
                     = numTokens * static_cast<SizeType64>(maxEncoderInputLengthInBatch);
                 batchedCopySizes.begin()[numCopiedTokens] = crossAttentionMaskRequestDim1;

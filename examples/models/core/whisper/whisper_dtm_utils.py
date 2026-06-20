@@ -7,6 +7,36 @@ from ordered_set import OrderedSet
 from run import WhisperDecoding, WhisperEncoding
 
 
+def prefixes_equal(prefix):
+    if len(prefix) <= 1:
+        return True
+    leader = prefix[0]
+    return all(torch.equal(leader, p) for p in prefix[1:])
+
+
+def build_cross_attention_masks(batch_size, prefix_len, draft_len, encoder_len):
+    """Optional cross-attention masks for batched external-draft verify.
+
+    Custom masks currently break external-draft acceptance; callers should rely
+    on the C++ default padding mask until mask row indexing is fixed for verify.
+    """
+    return None
+
+
+def replicate_encoder_for_batch(encoder_output, encoder_output_lengths,
+                                batch_size):
+    """Replicate bs=1 encoder features for identical batch slots."""
+    if isinstance(encoder_output_lengths, torch.Tensor):
+        enc_len = int(encoder_output_lengths[0].item())
+    elif isinstance(encoder_output_lengths, (list, tuple)):
+        enc_len = int(encoder_output_lengths[0])
+    else:
+        enc_len = int(encoder_output_lengths)
+    if batch_size == 1:
+        return [encoder_output], [enc_len]
+    return [encoder_output] * batch_size, [enc_len] * batch_size
+
+
 def _split_encoder_outputs(encoder_output, batch_size, encoder_output_lengths=None):
     if batch_size == 1:
         return [encoder_output]
@@ -72,21 +102,32 @@ class CppDraftRunner:
                  temperature,
                  top_k,
                  top_p,
-                 draft_engine_dir=None):
+                 draft_engine_dir=None,
+                 batch_size=1):
         self.runner = runner
         self.mel = mel
         self.mel_input_lengths = mel_input_lengths
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.batch_size = batch_size
+        self._committed_prefix_lens = [0] * batch_size
         self._encoder_output = None
         self._encoder_output_lengths = None
         if draft_engine_dir is not None:
             encoder = WhisperEncoding(draft_engine_dir)
+            single_mel = mel[:1] if mel.shape[0] > 1 else mel
+            single_lens = (mel_input_lengths[:1]
+                           if mel_input_lengths.shape[0] > 1 else mel_input_lengths)
             self._encoder_output, self._encoder_output_lengths = encoder.get_audio_features(
-                mel.transpose(1, 2), mel_input_lengths)
+                single_mel.transpose(1, 2), single_lens)
 
     def propose(self, prefix, end_id, draft_len):
+        if len(prefix) > 1 and prefixes_equal(prefix):
+            draft_tokens_list, max_d_len = self.propose([prefix[0]], end_id,
+                                                        draft_len)
+            return [draft_tokens_list[0][:] for _ in prefix], max_d_len
+
         gen_kwargs = dict(
             batch_input_ids=prefix,
             max_new_tokens=draft_len,
@@ -126,77 +167,81 @@ class CppDraftRunner:
             max_d_len = max(max_d_len, len(draft_ids))
         return draft_tokens_list, max_d_len
 
-    def commit_prefix(self, prefix_len):
-        return
+    def commit_prefix(self, prefix_len, batch_index=0):
+        if batch_index < len(self._committed_prefix_lens):
+            self._committed_prefix_lens[batch_index] = prefix_len
 
-    def on_rejection(self):
-        return
+    def on_rejection(self, batch_index=0):
+        if batch_index < len(self._committed_prefix_lens):
+            self._committed_prefix_lens[batch_index] = 0
 
 
 class PersistentWhisperDraftDecoder:
     """Draft decoder with encoder-once py_session path and session rewind on rejection."""
 
-    def __init__(self, draft_engine_dir, runtime_mapping, debug_mode=False):
+    def __init__(self, draft_engine_dir, runtime_mapping, debug_mode=False,
+                 max_batch_size=8):
         self.encoder = WhisperEncoding(draft_engine_dir)
         self.decoder = WhisperDecoding(draft_engine_dir,
                                        runtime_mapping,
                                        debug_mode=debug_mode)
+        self.max_batch_size = max_batch_size
         self._encoder_output = None
         self._encoder_output_lengths = None
         self._encoder_max_input_length = None
-        self._committed_prefix_len = 0
+        self._committed_prefix_lens = [0] * max_batch_size
         self._needs_reset = True
+        self._needs_reset_slots = set()
 
     def encode_once(self, mel, mel_input_lengths):
+        single_mel = mel[:1] if mel.dim() >= 3 and mel.shape[0] > 1 else mel
+        single_lens = (mel_input_lengths[:1]
+                       if mel_input_lengths.shape[0] > 1 else mel_input_lengths)
         encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
-            mel, mel_input_lengths)
+            single_mel, single_lens)
         self._encoder_output = encoder_output
         self._encoder_output_lengths = encoder_output_lengths
         self._encoder_max_input_length = torch.max(
             encoder_output_lengths).item()
-
-    def reset_session(self):
+        self._committed_prefix_lens = [0] * self.max_batch_size
+        self._needs_reset_slots.clear()
         self._needs_reset = True
-        self._committed_prefix_len = 0
+
+    def reset_session(self, batch_index=None):
+        if batch_index is None:
+            self._needs_reset_slots.clear()
+            self._committed_prefix_lens = [0] * self.max_batch_size
+        else:
+            self._needs_reset_slots.add(batch_index)
+            if batch_index < len(self._committed_prefix_lens):
+                self._committed_prefix_lens[batch_index] = 0
+        self._needs_reset = True
         self.decoder.rewind_draft_session()
+
+    def _should_force_reset(self, prefix_len, batch_size):
+        if self._needs_reset or self._needs_reset_slots:
+            return True
+        for bi in range(batch_size):
+            if prefix_len < self._committed_prefix_lens[bi]:
+                return True
+        return False
 
     def propose(self, prefix, end_id, draft_len):
         batch_size = len(prefix)
-        if batch_size == 1:
-            prefix_len = len(prefix[0])
-            force_reset = self._needs_reset or prefix_len < self._committed_prefix_len
-            if force_reset:
-                self._needs_reset = False
-                self._committed_prefix_len = 0
-
-            decoder_input_ids = prefix[0].unsqueeze(0).cuda()
-            output_ids = self.decoder.propose_draft(
-                decoder_input_ids,
-                self._encoder_output,
-                self._encoder_max_input_length,
-                self._encoder_output_lengths,
-                end_id,
-                draft_len,
-                force_reset=force_reset,
-            )
-            seq = output_ids[0][0]
-            if isinstance(seq, torch.Tensor):
-                seq = seq.tolist()
-            seq_len = len(seq)
-            if seq_len <= prefix_len:
-                return [[end_id]], 0
-            draft_ids = seq[prefix_len:seq_len]
-            self._committed_prefix_len = prefix_len
-            return [draft_ids], len(draft_ids)
-
         prefix_len = len(prefix[0])
-        force_reset = self._needs_reset or prefix_len < self._committed_prefix_len
+        force_reset = self._should_force_reset(prefix_len, batch_size)
         if force_reset:
             self._needs_reset = False
-            self._committed_prefix_len = 0
+            self._needs_reset_slots.clear()
+            for bi in range(batch_size):
+                self._committed_prefix_lens[bi] = 0
 
-        decoder_input_ids = torch.stack(
-            [p.cuda() for p in prefix]).type(torch.int32)
+        propose_prefix = prefix
+        if batch_size > 1 and prefixes_equal(prefix):
+            propose_prefix = [prefix[0]]
+
+        decoder_input_ids = propose_prefix[0].unsqueeze(0).cuda()
+
         output_ids = self.decoder.propose_draft(
             decoder_input_ids,
             self._encoder_output,
@@ -208,7 +253,7 @@ class PersistentWhisperDraftDecoder:
         )
         draft_tokens_list = []
         max_d_len = 0
-        for bi in range(batch_size):
+        for bi in range(len(propose_prefix)):
             seq = output_ids[bi][0]
             if isinstance(seq, torch.Tensor):
                 seq = seq.tolist()
@@ -219,16 +264,20 @@ class PersistentWhisperDraftDecoder:
             draft_ids = seq[prefix_len:seq_len]
             draft_tokens_list.append(draft_ids)
             max_d_len = max(max_d_len, len(draft_ids))
-        self._committed_prefix_len = prefix_len
+            self._committed_prefix_lens[bi] = prefix_len
+        if batch_size > len(draft_tokens_list):
+            leader = draft_tokens_list[0][:]
+            draft_tokens_list = [leader[:] for _ in range(batch_size)]
+            for bi in range(batch_size):
+                self._committed_prefix_lens[bi] = prefix_len
         return draft_tokens_list, max_d_len
 
     def commit_prefix(self, prefix_len, batch_index=0):
-        if batch_index == 0:
-            self._committed_prefix_len = prefix_len
+        if batch_index < len(self._committed_prefix_lens):
+            self._committed_prefix_lens[batch_index] = prefix_len
 
     def on_rejection(self, batch_index=0):
-        if batch_index == 0:
-            self.reset_session()
+        self.reset_session(batch_index)
 
 
 class IterationProfiler:

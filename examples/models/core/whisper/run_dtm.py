@@ -12,7 +12,8 @@ import torch
 
 from tokenizer import get_tokenizer
 from whisper_dtm_utils import (CppDraftRunner, IterationProfiler,
-                               NgramDraftPool, PersistentWhisperDraftDecoder)
+                               NgramDraftPool, PersistentWhisperDraftDecoder,
+                               replicate_encoder_for_batch)
 from whisper_utils import log_mel_spectrogram
 
 import tensorrt_llm
@@ -94,6 +95,17 @@ def parse_arguments():
     parser.add_argument('--top_k', type=int, default=1)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--dtype', type=str, default='float16')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Number of identical sequences to run in one DTM batch.')
+    parser.add_argument('--sync_identical_batch',
+                        action='store_true',
+                        help='Debug: force all batch slots to follow slot-0 prefix.')
+    parser.add_argument('--sequential_target_verify',
+                        action='store_true',
+                        help='Verify each batch slot separately (slower; debug).')
+    parser.add_argument('--batched_target_verify',
+                        action='store_true',
+                        help='Force batched target verify even at batch_size=1.')
     return parser.parse_args()
 
 
@@ -140,6 +152,29 @@ def _split_encoder_outputs(encoder_output, batch_size, encoder_output_lengths=No
     return [encoder_output[i] for i in range(batch_size)]
 
 
+def _resolve_batched_target_verify(args, batch_size):
+    if getattr(args, 'sequential_target_verify', False):
+        return False
+    if getattr(args, 'batched_target_verify', False):
+        return True
+    return batch_size > 1
+
+
+def _encode_target_for_batch(target_engine_dir, mel, mel_input_lengths,
+                             batch_size):
+    """Encode audio once and replicate encoder features for batch slots."""
+    target_encoder = WhisperEncoding(Path(target_engine_dir))
+    single_mel = mel[:1] if mel.shape[0] > 1 else mel
+    single_lens = (mel_input_lengths[:1]
+                   if mel_input_lengths.shape[0] > 1 else mel_input_lengths)
+    encoder_output, encoder_output_lengths = target_encoder.get_audio_features(
+        single_mel.transpose(1, 2), single_lens)
+    encoder_outputs, encoder_lengths = replicate_encoder_for_batch(
+        encoder_output, encoder_output_lengths, batch_size)
+    encoder_max_input_length = max(encoder_lengths)
+    return encoder_outputs, encoder_lengths, encoder_max_input_length
+
+
 def run_whisper_dtm(prefix,
                     target_runner,
                     draft_decoder,
@@ -156,7 +191,9 @@ def run_whisper_dtm(prefix,
                     top_k=1,
                     top_p=0.0,
                     profile=False,
-                    sync_identical_batch=False):
+                    sync_identical_batch=False,
+                    batched_target_verify=False,
+                    encoder_max_input_length=None):
     batch_size = len(prefix)
     input_len = len(prefix[0])
     max_seq_len = input_len + max_output_len
@@ -231,14 +268,44 @@ def run_whisper_dtm(prefix,
                 prefix, end_id, draft_len)
         draft_ms = (time.time() - draft_t0) * 1000.0
 
+        enc_len = encoder_max_input_length
+        if enc_len is None and target_encoder_output_lengths is not None:
+            enc_len = max(int(x) for x in target_encoder_output_lengths)
+
         target_t0 = time.time()
-        target = target_runner.generate(
-            batch_input_ids=prefix,
-            draft_tokens_list=draft_tokens_list,
-            draft_logits_list=None,
-            max_new_tokens=draft_len + 1,
-            **target_gen_common,
-        )
+        if batch_size == 1 or batched_target_verify:
+            target = target_runner.generate(
+                batch_input_ids=prefix,
+                draft_tokens_list=draft_tokens_list,
+                draft_logits_list=None,
+                max_new_tokens=draft_len + 1,
+                **target_gen_common,
+            )
+        else:
+            merged_output_ids = []
+            merged_seq_lens = []
+            for bi in range(batch_size):
+                slot_gen = dict(target_gen_common)
+                if isinstance(target_gen_common.get('encoder_outputs'), list):
+                    slot_gen['encoder_outputs'] = [
+                        target_gen_common['encoder_outputs'][bi]
+                    ]
+                    slot_gen['encoder_output_lengths'] = [
+                        target_gen_common['encoder_output_lengths'][bi]
+                    ]
+                slot_out = target_runner.generate(
+                    batch_input_ids=[prefix[bi]],
+                    draft_tokens_list=[draft_tokens_list[bi]],
+                    draft_logits_list=None,
+                    max_new_tokens=draft_len + 1,
+                    **slot_gen,
+                )
+                merged_output_ids.append(slot_out['output_ids'])
+                merged_seq_lens.append(slot_out['sequence_lengths'])
+            target = {
+                'output_ids': torch.cat(merged_output_ids, dim=0),
+                'sequence_lengths': torch.cat(merged_seq_lens, dim=0),
+            }
         torch.cuda.synchronize()
         target_ms = (time.time() - target_t0) * 1000.0
 
@@ -297,11 +364,21 @@ def run_whisper_dtm(prefix,
     return output_ids, stats
 
 
+def _scaled_kv_fractions(batch_size, draft_fraction, target_fraction):
+    scale = max(1.0, batch_size / 2.0)
+    return draft_fraction / scale, target_fraction / scale
+
+
 def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
                    mel, mel_input_lengths, batch_size=1):
     shared_fraction = getattr(args, 'kv_cache_free_gpu_memory_fraction', None)
     draft_fraction = shared_fraction if shared_fraction is not None else args.draft_kv_cache_free_gpu_memory_fraction
     target_fraction = shared_fraction if shared_fraction is not None else args.target_kv_cache_free_gpu_memory_fraction
+    draft_fraction, target_fraction = _scaled_kv_fractions(
+        batch_size, draft_fraction, target_fraction)
+
+    use_batched_target = _resolve_batched_target_verify(args, batch_size)
+    target_max_batch = batch_size if use_batched_target else 1
 
     common_runner_kwargs = dict(
         is_enc_dec=True,
@@ -320,7 +397,8 @@ def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
         if args.draft_backend == 'py':
             runtime_mapping = tensorrt_llm.Mapping(1, runtime_rank)
             draft_decoder = PersistentWhisperDraftDecoder(
-                Path(args.draft_engine_dir), runtime_mapping)
+                Path(args.draft_engine_dir), runtime_mapping,
+                max_batch_size=batch_size)
         else:
             draft_runner = ModelRunnerCpp.from_dir(
                 engine_dir=args.draft_engine_dir,
@@ -335,20 +413,123 @@ def _build_runners(args, draft_device_list, target_device_list, runtime_rank,
                                            args.top_k,
                                            args.top_p,
                                            draft_engine_dir=Path(
-                                               args.draft_engine_dir))
+                                               args.draft_engine_dir),
+                                           batch_size=batch_size)
 
     target_runner = ModelRunnerCpp.from_dir(
         engine_dir=args.target_engine_dir,
         device_ids=target_device_list,
         kv_cache_free_gpu_memory_fraction=target_fraction,
-        **common_runner_kwargs,
+        is_enc_dec=True,
+        max_batch_size=target_max_batch,
+        max_input_len=3000,
+        max_output_len=args.max_output_len,
+        max_beam_width=1,
+        kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+        cross_kv_cache_fraction=0.5,
+        is_orchestrator_mode=False,
+        rank=runtime_rank,
     )
     return draft_decoder, target_runner
 
 
+class DTMSession:
+    """Reusable DTM runners and target encoder cache for repeated runs."""
+
+    def __init__(self, args, draft_device_list, target_device_list, prefix,
+                 mel, mel_input_lengths, batch_size=1):
+        self.args = args
+        self.draft_len_cfg = None
+        self.draft_device_list = draft_device_list
+        self.target_device_list = target_device_list
+        self.batch_size = batch_size
+        self.duration = None
+        self.end_id = None
+
+        if batch_size > 1:
+            mel = mel.repeat(batch_size, 1, 1)
+            mel_input_lengths = mel_input_lengths.repeat(batch_size)
+            prefix = [prefix[0].clone() for _ in range(batch_size)]
+
+        self.prefix = prefix
+        self.mel = mel
+        self.mel_input_lengths = mel_input_lengths
+
+        runtime_rank = tensorrt_llm.mpi_rank()
+        self.draft_decoder, self.target_runner = _build_runners(
+            args, draft_device_list, target_device_list, runtime_rank, mel,
+            mel_input_lengths, batch_size=batch_size)
+        if isinstance(self.draft_decoder, PersistentWhisperDraftDecoder):
+            self.draft_decoder.encode_once(self.mel[:1].transpose(1, 2),
+                                           self.mel_input_lengths[:1])
+
+        self.ngram_pool = None
+        self.encoder_max_input_length = None
+        self.encoder_outputs = None
+        self.encoder_output_lengths = None
+        self._encode_target_once()
+
+    def _encode_target_once(self):
+        self.encoder_outputs, self.encoder_output_lengths, self.encoder_max_input_length = (
+            _encode_target_for_batch(self.args.target_engine_dir, self.mel,
+                                     self.mel_input_lengths, self.batch_size))
+
+    def setup_ngram_pool(self, draft_len, end_id):
+        if self.args.draft_mode in ('ngram', 'hybrid'):
+            self.ngram_pool = NgramDraftPool(draft_len,
+                                             self.args.ngram_max_matching_size,
+                                             end_id)
+
+    def run(self, draft_len, end_id, profile=False, sync_identical_batch=False,
+            batched_target_verify=None):
+        if batched_target_verify is None:
+            batched_target_verify = _resolve_batched_target_verify(
+                self.args, self.batch_size)
+        if self.ngram_pool is None:
+            self.setup_ngram_pool(draft_len, end_id)
+        start = time.time()
+        output_ids, stats = run_whisper_dtm(
+            self.prefix,
+            self.target_runner,
+            self.draft_decoder,
+            self.ngram_pool,
+            self.args.draft_mode,
+            draft_len,
+            end_id,
+            self.args.max_output_len,
+            self.mel,
+            self.mel_input_lengths,
+            target_encoder_output=self.encoder_outputs,
+            target_encoder_output_lengths=self.encoder_output_lengths,
+            temperature=self.args.temperature,
+            top_k=self.args.top_k,
+            top_p=self.args.top_p,
+            profile=profile,
+            sync_identical_batch=sync_identical_batch,
+            batched_target_verify=batched_target_verify,
+            encoder_max_input_length=self.encoder_max_input_length,
+        )
+        elapsed = time.time() - start
+        stats['elapsed'] = elapsed
+        stats['elapsed_per_seq'] = elapsed / self.batch_size
+        stats['rtf'] = elapsed / (self.duration * self.batch_size)
+        stats['rtf_per_seq'] = stats['elapsed_per_seq'] / self.duration
+        return output_ids, stats
+
+
 def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
               mel, mel_input_lengths, duration, end_id, batch_size=1,
-              sync_identical_batch=False):
+              sync_identical_batch=False, session=None):
+    if session is not None:
+        session.duration = duration
+        session.end_id = end_id
+        return session.run(draft_len,
+                           end_id,
+                           profile=getattr(args, 'profile', False),
+                           sync_identical_batch=sync_identical_batch,
+                           batched_target_verify=_resolve_batched_target_verify(
+                               args, batch_size))
+
     runtime_rank = tensorrt_llm.mpi_rank()
     if batch_size > 1:
         mel = mel.repeat(batch_size, 1, 1)
@@ -359,18 +540,17 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         args, draft_device_list, target_device_list, runtime_rank, mel,
         mel_input_lengths, batch_size=batch_size)
     if isinstance(draft_decoder, PersistentWhisperDraftDecoder):
-        draft_decoder.encode_once(mel.transpose(1, 2), mel_input_lengths)
+        draft_decoder.encode_once(mel[:1].transpose(1, 2),
+                                  mel_input_lengths[:1])
 
     ngram_pool = None
     if args.draft_mode in ('ngram', 'hybrid'):
         ngram_pool = NgramDraftPool(draft_len, args.ngram_max_matching_size,
                                     end_id)
 
-    target_encoder = WhisperEncoding(Path(args.target_engine_dir))
-    target_encoder_output, target_encoder_output_lengths = target_encoder.get_audio_features(
-        mel.transpose(1, 2), mel_input_lengths)
-    encoder_outputs = _split_encoder_outputs(
-        target_encoder_output, batch_size, target_encoder_output_lengths.tolist())
+    encoder_outputs, encoder_output_lengths, encoder_max_input_length = (
+        _encode_target_for_batch(args.target_engine_dir, mel, mel_input_lengths,
+                                 batch_size))
 
     start = time.time()
     output_ids, stats = run_whisper_dtm(
@@ -385,12 +565,14 @@ def _run_once(args, draft_len, draft_device_list, target_device_list, prefix,
         mel,
         mel_input_lengths,
         target_encoder_output=encoder_outputs,
-        target_encoder_output_lengths=target_encoder_output_lengths.tolist(),
+        target_encoder_output_lengths=encoder_output_lengths,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
-        profile=args.profile,
-        sync_identical_batch=sync_identical_batch or batch_size > 1,
+        profile=getattr(args, 'profile', False),
+        sync_identical_batch=sync_identical_batch,
+        batched_target_verify=_resolve_batched_target_verify(args, batch_size),
+        encoder_max_input_length=encoder_max_input_length,
     )
     elapsed = time.time() - start
     stats['elapsed'] = elapsed
@@ -472,7 +654,9 @@ def main():
 
     output_ids, stats = _run_once(args, draft_len, draft_device_list,
                                   target_device_list, prefix, mel,
-                                  mel_input_lengths, duration, end_id)
+                                  mel_input_lengths, duration, end_id,
+                                  batch_size=args.batch_size,
+                                  sync_identical_batch=args.sync_identical_batch)
 
     text = tokenizer.decode(output_ids.tolist()).strip()
     text = re.sub(r'<\|.*?\|>', '', text)

@@ -31,13 +31,14 @@ def _build_whisper_enc_dec_engine(converted_weight_dir,
                                   output_dir,
                                   component,
                                   extra_decoder_flags=None,
+                                  max_batch_size=1,
                                   llm_venv=None):
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={converted_weight_dir}/{component}",
         f"--output_dir={output_dir}/{component}",
         "--moe_plugin=disable",
-        "--max_batch_size=1",
+        f"--max_batch_size={max_batch_size}",
         "--bert_attention_plugin=float16",
     ]
     if component == "encoder":
@@ -154,3 +155,76 @@ def test_whisper_dtm(llm_venv, engine_dir, whisper_example_root,
         assert acceptance > 0.0
     else:
         assert acceptance >= 0.0
+
+
+@skip_post_blackwell
+@pytest.mark.parametrize("whisper_model_root", ["large-v3"], indirect=True)
+def test_whisper_dtm_batch_parity(llm_venv, engine_dir, whisper_example_root,
+                                  whisper_model_root, whisper_example_audio_file):
+    """Batched DTM with identical inputs: all slots match slot 0."""
+    target_model_name, target_ckpt_dir = whisper_model_root
+    draft_ckpt_parent = os.path.join(
+        os.path.dirname(target_ckpt_dir.rstrip('/')),
+        "whisper-large-v3-turbo")
+    if not os.path.isdir(draft_ckpt_parent):
+        pytest.skip(f"Draft checkpoint {draft_ckpt_parent} not available")
+
+    target_engine_dir = os.path.join(
+        engine_dir, f"{target_model_name}_dtm_batch_target_float16")
+    draft_engine_dir = os.path.join(
+        engine_dir, f"{target_model_name}_dtm_batch_draft_float16")
+
+    target_converted = convert_weights(
+        llm_venv=llm_venv,
+        example_root=whisper_example_root,
+        cmodel_dir=target_engine_dir,
+        model=target_model_name,
+        model_path=target_ckpt_dir,
+        use_weight_only=False,
+        weight_only_precision=None,
+    )
+    draft_converted = os.path.join(draft_engine_dir, "large-v3-turbo", "float16")
+    venv_check_call(
+        llm_venv, [
+            f"{whisper_example_root}/convert_checkpoint.py",
+            "--model_dir", draft_ckpt_parent,
+            "--model_name", "large-v3-turbo",
+            "--output_dir", draft_converted,
+        ])
+
+    for component in ["encoder", "decoder"]:
+        _build_whisper_enc_dec_engine(
+            target_converted,
+            target_engine_dir,
+            component,
+            extra_decoder_flags=[
+                "--speculative_decoding_mode=draft_tokens_external",
+                "--max_draft_len=16",
+            ] if component == "decoder" else None,
+            max_batch_size=2,
+            llm_venv=llm_venv)
+        _build_whisper_enc_dec_engine(draft_converted,
+                                      draft_engine_dir,
+                                      component,
+                                      max_batch_size=2,
+                                      llm_venv=llm_venv)
+
+    batch_cmd = [
+        f"{whisper_example_root}/run_dtm.py",
+        f"--draft_engine_dir={draft_engine_dir}",
+        f"--target_engine_dir={target_engine_dir}",
+        f"--input_file={whisper_example_audio_file}",
+        f"--assets_dir={target_ckpt_dir}",
+        '--draft_target_model_config=[16,[0],[0],False]',
+        '--draft_mode=hybrid',
+        '--draft_backend=py',
+        '--batch_size=2',
+        '--draft_kv_cache_free_gpu_memory_fraction=0.08',
+        '--target_kv_cache_free_gpu_memory_fraction=0.10',
+        "--log_level=info",
+    ]
+    output = venv_check_call(llm_venv, batch_cmd)
+    match = re.search(r"Acceptance rate:\s*([\d.]+)%", output)
+    assert match is not None
+    acceptance = float(match.group(1))
+    assert acceptance >= 90.0, f"Batched DTM acceptance too low: {acceptance}%"

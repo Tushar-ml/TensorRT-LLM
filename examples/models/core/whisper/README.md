@@ -252,6 +252,53 @@ MAX_DRAFT_LEN=32 bash build_dtm_target_engine.sh
 # PRECISION=float8 DRAFT_ENGINE=whisper_turbo_fp8_draft_engine bash build_draft_engines.sh
 ```
 
+#### Batch DTM (identical inputs)
+
+Build a unified bs8 DTM target engine and align draft batch size:
+
+```bash
+MAX_BATCH=8 MAX_DRAFT_LEN=16 bash build_dtm_target_engine.sh
+MAX_BATCH=8 bash build_draft_engines.sh
+```
+
+Run batched DTM (encoder encoded once per clip and replicated across slots; batched target verify is default for `--batch_size>1`):
+
+```bash
+python3 run_dtm.py \
+  --draft_engine_dir ${DRAFT_ENGINE} \
+  --target_engine_dir whisper_large_v3_dtm_bs8_engine \
+  --draft_target_model_config="[16,[0],[0],False]" \
+  --input_file /home/ubuntu/audio_60s_30s.wav \
+  --assets_dir assets \
+  --batch_size 8 \
+  --draft_kv_cache_free_gpu_memory_fraction 0.08 \
+  --target_kv_cache_free_gpu_memory_fraction 0.10
+```
+
+Profile turbo, large-v3, and DTM across batch sizes (subprocess workers; uses `DTMSession` for runner reuse):
+
+```bash
+python3 profile_dtm_batch.py \
+  --input_file /home/ubuntu/audio_60s_30s.wav \
+  --assets_dir assets \
+  --draft_engine_dir ${DRAFT_ENGINE} \
+  --target_engine_dir whisper_large_v3_dtm_engine \
+  --target_engine_dir_bs8 whisper_large_v3_dtm_bs8_engine \
+  --baseline_engine_dir ${BASELINE_ENGINE} \
+  --batch_sizes 1,2,4,8
+```
+
+Example results (H100 80GB, 30s clip, `draft_len=16`, hybrid/py):
+
+| bs | turbo/seq | v3/seq | DTM/seq | accept% | DTM vs v3 |
+|---:|----------:|-------:|--------:|--------:|----------:|
+| 1 | 0.075s | 0.343s | 0.194s | 94.8% | 0.57× |
+| 2 | 0.041s | 0.176s | 0.100s | 94.8% | 0.57× |
+| 4 | 0.024s | 0.094s | 0.054s | 94.8% | 0.57× |
+| 8 | 0.015s | 0.056s | 0.042s | 94.8% | 0.74× |
+
+Use `--sequential_target_verify` to debug per-slot verify; `--sync_identical_batch` forces slot-0 prefix (debug only).
+
 Legacy DTM invocation (full ModelRunnerCpp draft path):
 
 ```bash

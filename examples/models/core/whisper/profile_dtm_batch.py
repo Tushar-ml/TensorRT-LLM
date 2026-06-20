@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 from run import read_config
-from run_dtm import _prepare_mel, _run_once
+from run_dtm import (DTMSession, _prepare_mel, _run_once)
 from tokenizer import get_tokenizer
 
 from tensorrt_llm.runtime import ModelRunnerCpp
@@ -95,18 +95,21 @@ def _bench_dtm(args, draft_len, prefix, mel, mel_lens, duration, end_id,
         args.draft_target_model_config)
     del draft_len_cfg
     try:
+        session = DTMSession(args, draft_devices, target_devices, prefix, mel,
+                             mel_lens, batch_size=batch_size)
+        session.duration = duration
+        session.end_id = end_id
+        session.setup_ngram_pool(draft_len, end_id)
         for _ in range(warmup):
-            _run_once(args, draft_len, draft_devices, target_devices, prefix,
-                      mel, mel_lens, duration, end_id, batch_size=batch_size)
+            session.run(draft_len, end_id, profile=False)
             torch.cuda.synchronize()
         times = []
         last_stats = {}
         last_profile = {}
         for i in range(iters):
-            args.profile = (i == iters - 1)
-            _, stats = _run_once(args, draft_len, draft_devices, target_devices,
-                                 prefix, mel, mel_lens, duration, end_id,
-                                 batch_size=batch_size)
+            _, stats = session.run(draft_len,
+                                   end_id,
+                                   profile=(i == iters - 1))
             torch.cuda.synchronize()
             times.append(stats['elapsed'])
             last_stats = stats
@@ -226,8 +229,8 @@ def main():
     print(f'Audio: {args.input_file}')
     print(f'Engine max_batch_size: turbo={turbo_max} v3={v3_max} '
           f'dtm={dtm_max} dtm_bs8={dtm_bs8_max}')
-    print('(Identical clip repeated per batch slot; DTM bs>1 uses prefix sync '
-          'for benchmark — batched enc-dec spec-dec verify may reduce acceptance.)')
+    print('(Identical clip repeated per batch slot; encoder encoded once and '
+          'replicated; batched target verify enabled for bs>1.)')
     print()
 
     rows = []

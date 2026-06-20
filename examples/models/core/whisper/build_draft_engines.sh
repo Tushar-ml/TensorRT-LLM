@@ -6,7 +6,7 @@ DRAFT_CKPT="${DRAFT_CKPT:-whisper_turbo_weights}"
 DRAFT_MODEL="${DRAFT_MODEL:-large-v3-turbo}"
 DRAFT_ENGINE="${DRAFT_ENGINE:-whisper_turbo_engine}"
 ASSETS="${ASSETS:-assets}"
-MAX_BATCH="${MAX_BATCH:-1}"
+MAX_BATCH="${MAX_BATCH:-8}"
 PRECISION="${PRECISION:-float16}"
 
 python3 convert_checkpoint.py \
