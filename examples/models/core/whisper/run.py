@@ -230,6 +230,9 @@ class WhisperDecoding:
             engine_dir, runtime_mapping, debug_mode)
         self._draft_session_active = False
         self._draft_committed_prefix_len = 0
+        self._draft_kv_ready = False
+        self._draft_setup_done = False
+        self._draft_setup_max_context = 0
 
     def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
         serialize_path = engine_dir / 'decoder' / 'rank0.engine'
@@ -272,7 +275,10 @@ class WhisperDecoding:
                  encoder_input_lengths,
                  eot_id,
                  max_new_tokens=40,
-                 num_beams=1):
+                 num_beams=1,
+                 reuse_kv_cache=False,
+                 past_context_length=0,
+                 skip_setup=False):
         batch_size = decoder_input_ids.shape[0]
         decoder_input_lengths = torch.tensor([
             decoder_input_ids.shape[-1]
@@ -290,12 +296,13 @@ class WhisperDecoding:
         sampling_config = SamplingConfig(end_id=eot_id,
                                          pad_id=eot_id,
                                          num_beams=num_beams)
-        self.decoder_generation_session.setup(
-            decoder_input_lengths.size(0),
-            decoder_max_input_length,
-            max_new_tokens,
-            beam_width=num_beams,
-            encoder_max_input_length=encoder_max_input_length)
+        if not skip_setup:
+            self.decoder_generation_session.setup(
+                decoder_input_lengths.size(0),
+                decoder_max_input_length,
+                max_new_tokens,
+                beam_width=num_beams,
+                encoder_max_input_length=encoder_max_input_length)
 
         torch.cuda.synchronize()
 
@@ -320,12 +327,23 @@ class WhisperDecoding:
             encoder_output=encoder_outputs,
             encoder_input_lengths=encoder_input_lengths,
             cross_attention_mask=cross_attention_mask,
+            reuse_kv_cache=reuse_kv_cache,
+            past_context_length=past_context_length,
         )
         torch.cuda.synchronize()
 
         # get the list of int from output_ids tensor
         output_ids = output_ids.cpu().numpy().tolist()
         return output_ids
+
+
+    def _clear_draft_kv_state(self):
+        session = self.decoder_generation_session
+        if hasattr(session, 'pools_kv_cache_manager'):
+            session.pools_kv_cache_manager = None
+        if getattr(session, 'cross_attention', False):
+            session.cross_pools_kv_cache_manager = None
+        session.cross_kv_reuse = None
 
 
     def propose_draft(self,
@@ -336,29 +354,61 @@ class WhisperDecoding:
                       eot_id,
                       draft_len,
                       force_reset=False):
-        """Propose draft tokens, reusing decoder session when prefix grows monotonically."""
+        """Propose draft tokens with incremental self-attention KV reuse."""
         if force_reset:
-            self._draft_session_active = False
+            self.rewind_draft_session()
 
-        prefix_len = decoder_input_ids.shape[-1]
-        if (not getattr(self, '_draft_session_active', False)
-                or prefix_len < getattr(self, '_draft_committed_prefix_len', 0)):
+        prefix_len = int(decoder_input_ids.shape[-1])
+        past_len = (self._draft_committed_prefix_len
+                    if self._draft_session_active else 0)
+        full_reset = (not self._draft_session_active or prefix_len < past_len)
+
+        if full_reset:
+            past_len = 0
+            reuse_kv = False
             self._draft_session_active = True
-            self._draft_committed_prefix_len = 0
+            self._draft_kv_ready = False
+            self._draft_setup_done = False
+            self._draft_setup_max_context = 0
+            self._clear_draft_kv_state()
+        elif prefix_len > self._draft_setup_max_context:
+            reuse_kv = False
+            past_len = 0
+            self._draft_kv_ready = False
+            self._draft_setup_done = False
+            self._draft_setup_max_context = 0
+            self._clear_draft_kv_state()
+        else:
+            reuse_kv = self._draft_kv_ready and past_len > 0
 
-        output_ids = self.generate(decoder_input_ids,
-                                   encoder_outputs,
-                                   encoder_max_input_length,
-                                   encoder_input_lengths,
-                                   eot_id,
-                                   max_new_tokens=draft_len,
-                                   num_beams=1)
+        skip_setup = self._draft_setup_done and not full_reset
+        if not skip_setup:
+            self._draft_setup_max_context = prefix_len
+
+        output_ids = self.generate(
+            decoder_input_ids,
+            encoder_outputs,
+            encoder_max_input_length,
+            encoder_input_lengths,
+            eot_id,
+            max_new_tokens=draft_len,
+            num_beams=1,
+            reuse_kv_cache=reuse_kv,
+            past_context_length=past_len if reuse_kv else 0,
+            skip_setup=skip_setup,
+        )
         self._draft_committed_prefix_len = prefix_len
+        self._draft_kv_ready = True
+        self._draft_setup_done = True
         return output_ids
 
     def rewind_draft_session(self):
         self._draft_session_active = False
         self._draft_committed_prefix_len = 0
+        self._draft_kv_ready = False
+        self._draft_setup_done = False
+        self._draft_setup_max_context = 0
+        self._clear_draft_kv_state()
 
 
 class WhisperTRTLLM(object):
