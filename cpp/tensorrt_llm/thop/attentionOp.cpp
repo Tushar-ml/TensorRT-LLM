@@ -377,7 +377,7 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<torch::Tensor> relative_attention_bias, bool const skip_kv_cache_update) const
         = 0;
 };
 
@@ -446,7 +446,7 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const override
+        std::optional<torch::Tensor> relative_attention_bias, bool const skip_kv_cache_update) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -765,6 +765,9 @@ public:
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
         common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers). On the base params
+        // so both context and generation enqueue inherit it via copy.
+        common_enqueue_params.skip_kv_cache_update = skip_kv_cache_update;
         if (is_cross)
         {
             // For cross attention, the KV (encoder) sequence lengths are passed in via
@@ -1037,10 +1040,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     bool const use_sage_attn
         = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn || is_cross,
-        "For non-MLA, non-cross, non-SageAttention attention, only fused QKV is supported now.");
-    TLLM_CHECK_WITH_INFO(
-        update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
+    // Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): a non-MLA,
+    // non-cross, non-SageAttention self-attention layer that provides Q only and
+    // reads K/V from a shared cache slot WITHOUT appending. It is identified uniquely
+    // by the existing flags (no torch-schema change): not fused QKV and KV update
+    // disabled. The QKV preprocessing skips the K/V input read + cache write, and the
+    // generation kernel only reads the existing (backbone-written) cache.
+    bool const kv_share_read_only
+        = !is_mla_enable && !is_fused_qkv && !use_sage_attn && !is_cross && !update_kv_cache;
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn || is_cross || kv_share_read_only,
+        "For non-MLA, non-cross, non-SageAttention attention, only fused QKV (or Q-only KV-shared) is supported now.");
+    TLLM_CHECK_WITH_INFO(update_kv_cache || is_cross || kv_share_read_only,
+        "KV cache update cannot be disabled now (except for cross attention or Q-only KV-shared layers).");
     auto qkv_or_q = q;
     if (is_fused_qkv)
     {
@@ -1326,7 +1337,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
+            kv_share_read_only);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1348,7 +1360,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
+            kv_share_read_only);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

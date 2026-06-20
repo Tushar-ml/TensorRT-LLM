@@ -485,18 +485,23 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             auto const src_k_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_k_offset + hidden_idx_kv;
             auto const src_v_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_v_offset + hidden_idx_kv;
 
-            VecType q, k, v, q_pair, k_pair;
+            VecType q{}, k{}, v{}, q_pair{}, k_pair{};
             // key without position embedding
-            VecType k_wo_pos;
+            VecType k_wo_pos{};
 
             // load q,k,v and add bias
             if (valid_head_dim_idx)
             {
                 q = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx]);
-                k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
-                v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
                 q_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-                k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                // Read-only KV sharing: the input is Q-only, so skip reading K/V
+                // from the input buffer (avoids over-reading past the Q region).
+                if (!params.skip_kv_cache_update)
+                {
+                    k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
+                    v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
+                    k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                }
 
                 if constexpr (ADD_BIAS)
                 {
@@ -577,7 +582,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
             bool const useKVCache = params.kv_cache_buffer.data != nullptr;
             auto token_idx_in_kv_cache = token_idx_in_seq;
-            bool valid_kv_cache_pos = useKVCache;
+            // Read-only KV sharing: never write the current token's K/V.
+            bool valid_kv_cache_pos = useKVCache && !params.skip_kv_cache_update;
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -901,12 +907,20 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
-        auto k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
-        auto v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+        // For read-only KV sharing the input buffer is Q-only: K/V are already in
+        // the (shared) cache slot, so we must not read them from the input (it would
+        // over-read past the Q region) nor recompute/store them below.
+        VecT k{};
+        VecT v{};
         [[maybe_unused]] auto q_pair
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-        [[maybe_unused]] auto k_pair
-            = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        [[maybe_unused]] VecT k_pair{};
+        if (!params.skip_kv_cache_update)
+        {
+            k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
+            v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+            k_pair = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        }
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.
         if constexpr (ADD_BIAS)
@@ -993,7 +1007,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         auto const channelIdx = head_dim_vec_idx;
         bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
-        bool valid_kv_cache_pos = useKVCache;
+        // Read-only KV sharing: never write the current token's K/V (the shared
+        // cache slot already holds the K/V written by the backbone/target layer).
+        bool valid_kv_cache_pos = useKVCache && !params.skip_kv_cache_update;
 
         auto kDst = useKVCache
             ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))

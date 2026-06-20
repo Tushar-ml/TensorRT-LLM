@@ -210,6 +210,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
     xqaParams.layer_idx = generationsParams.layer_idx;
+    // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): preprocessing skips
+    // the K/V input read + cache write; the kernel reads the existing (shared) cache.
+    xqaParams.skip_kv_cache_update = generationsParams.skip_kv_cache_update;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -319,6 +322,32 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
 #endif
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
+
+    if (xqaParams.skip_kv_cache_update && std::getenv("GEMMA4_XQA_DBG") != nullptr)
+    {
+        int seqlens_host[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        int const nseq = std::min(8, std::max(1, generationsParams.num_requests));
+        if (xqaParams.sequence_lengths != nullptr)
+        {
+            cudaMemcpy(seqlens_host, xqaParams.sequence_lengths, nseq * sizeof(int), cudaMemcpyDeviceToHost);
+        }
+        int past0 = -1, past1 = -1;
+        if (generationsParams.host_past_key_value_lengths != nullptr)
+        {
+            past0 = generationsParams.host_past_key_value_lengths[0];
+            past1 = nseq > 1 ? generationsParams.host_past_key_value_lengths[1] : -1;
+        }
+        TLLM_LOG_INFO(
+            "[GEMMA4_XQA_DBG] read-only-KV layer_idx=%d num_q=%d num_kv=%d head_size=%d "
+            "multi_query_tokens=%d spec_max_gen_len=%d gen_input_len=%d max_past_kv=%d "
+            "total_input_tokens=%d num_tokens=%d cyclic_win=%d nseq=%d seqlens=[%d,%d,%d,%d] "
+            "host_past_kv=[%d,%d] max_attn_win=%d",
+            xqaParams.layer_idx, xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size,
+            (int) xqaParams.multi_query_tokens, xqaParams.spec_decoding_max_generation_length,
+            xqaParams.generation_input_length, xqaParams.max_past_kv_length, xqaParams.total_num_input_tokens,
+            generationsParams.num_tokens, xqaParams.cyclic_attention_window_size, nseq, seqlens_host[0],
+            seqlens_host[1], seqlens_host[2], seqlens_host[3], past0, past1, generationsParams.max_attention_window_size);
+    }
 
     return true;
 }
@@ -1783,6 +1812,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA || isCrossAttention();
         preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
         preprocessingParams.generation_phase = false;
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): skip reading K/V
+        // from the Q-only input and skip the K/V cache write in the context path too
+        // (the shared cache slot already holds the backbone-written K/V).
+        preprocessingParams.skip_kv_cache_update = params.skip_kv_cache_update;
         preprocessingParams.multi_processor_count = mMultiProcessorCount;
 
         preprocessingParams.rotary_vision_start = mVisionStart;
@@ -2466,6 +2499,12 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             }
             {
                 mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
+            }
+            if (xqaParams.skip_kv_cache_update && std::getenv("GEMMA4_XQA_DBG") != nullptr)
+            {
+                cudaError_t const dbgErr = cudaStreamSynchronize(stream);
+                TLLM_LOG_INFO("[GEMMA4_XQA_DBG] post-XQA sync layer_idx=%d head_size=%d -> %s", xqaParams.layer_idx,
+                    xqaParams.head_size, cudaGetErrorString(dbgErr));
             }
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
             {

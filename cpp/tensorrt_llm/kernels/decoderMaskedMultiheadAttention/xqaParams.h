@@ -109,6 +109,11 @@ struct XQAParams
     bool multi_query_tokens = false;
     bool is_spec_dec_tree
         = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
+    // Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): the input is
+    // Q-only and the layer reads K/V already present in the (shared) cache slot.
+    // The QKV preprocessing skips reading K/V from the input and skips the
+    // current-token K/V cache write; the XQA kernel only reads the existing cache.
+    bool skip_kv_cache_update = false;
 
     float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
 

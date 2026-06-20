@@ -1788,7 +1788,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # whose K/V live in another layer's cache slot (self.layer_idx already
         # points there).  q is Q-only (not fused) and the current token's K/V was
         # written by the owning layer earlier this forward, so do not treat it as
-        # fused-QKV and do not re-append KV here.
+        # fused-QKV and do not re-append KV here.  The C++ attention op derives
+        # its read-only-KV (skip_kv_cache_update) mode from exactly this flag
+        # combination (not fused-QKV, no KV update, non-cross, non-MLA).
         kv_shared_no_append = getattr(self, "kv_shared_no_append", False)
         forward_args.is_fused_qkv = (not metadata.is_cross and k is None
                                      and not kv_shared_no_append)
