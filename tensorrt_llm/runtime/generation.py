@@ -2228,8 +2228,11 @@ class GenerationSession(object):
 
         if self.cross_attention:
             # in context phase, need to generate cross kv cache, set to True
-            add_tensor(torch.ones(1, dtype=torch.bool, device=self.device),
-                       'cross_kv_cache_gen')
+            gen_cross_kv = not getattr(self, '_reuse_cross_kv_cache', False)
+            add_tensor(
+                torch.tensor([gen_cross_kv],
+                             dtype=torch.bool,
+                             device=self.device), 'cross_kv_cache_gen')
             if self._model_config.skip_cross_attn_blocks:
                 add_tensor(skip_cross_attn_blocks, 'skip_cross_attn_blocks')
             if self.skip_cross_kv:
@@ -3566,7 +3569,9 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
             context_runtime_perf_knobs = model_inputs.get(
                 'host_runtime_perf_knobs', None)
-            host_context_progress = torch.tensor([0], dtype=torch.int64)
+            progress_offset = getattr(self, '_host_context_progress_offset', 0)
+            host_context_progress = torch.tensor([progress_offset],
+                                                 dtype=torch.int64)
 
             if self.paged_kv_cache and self.has_attn_layers:
                 host_kv_cache_block_offsets = self.pools_kv_cache_manager.get_block_offsets(
@@ -3709,7 +3714,15 @@ class GenerationSession(object):
 
         # Initialize sequence_lengths (no paddings) for the generation phase.
         if step == 0 and not self.is_medusa_mode and not self.is_redrafter_mode:  # Medusa/ReDrafter has its own logic
-            self.sequence_length_buffer = context_lengths.detach().clone()
+            progress_offset = getattr(self, '_host_context_progress_offset', 0)
+            if progress_offset > 0:
+                self.sequence_length_buffer = torch.full(
+                    (batch_size * beam_width, 1),
+                    progress_offset,
+                    dtype=torch.int32,
+                    device=self.device)
+            else:
+                self.sequence_length_buffer = context_lengths.detach().clone()
 
         if self.is_redrafter_mode:
             # to simplify some processing logic, always swap buffers after execution
@@ -4307,12 +4320,20 @@ class GenerationSession(object):
                stopping_criteria: StoppingCriteria = None,
                logits_processor: LogitsProcessor = None,
                cross_attention_mask: List[torch.Tensor] = None,
+               reuse_kv_cache: bool = False,
+               past_context_length: int = 0,
                **kwargs):
         scfg = sampling_config
         batch_size = context_lengths.size(0)
         beam_width = scfg.num_beams
         max_context_length = torch.max(context_lengths).item()
         host_context_lengths = context_lengths.cpu()
+        can_reuse_kv = (reuse_kv_cache and past_context_length > 0
+                        and past_context_length <= max_context_length
+                        and hasattr(self, 'pools_kv_cache_manager')
+                        and self.pools_kv_cache_manager is not None)
+        self._host_context_progress_offset = past_context_length if can_reuse_kv else 0
+        self._reuse_cross_kv_cache = can_reuse_kv and self.cross_attention
         assert batch_size == self.batch_size, \
             "Given batch size is different from the one used in setup()," \
             "rerun the setup function with the new batch size to avoid buffer overflow."
@@ -4342,8 +4363,10 @@ class GenerationSession(object):
                                             device=self.device)
 
         # Sequence_lengths for the dynamic decoder still has the input paddings.
+        initial_seq_len = (past_context_length
+                           if can_reuse_kv else max_context_length)
         sequence_lengths = torch.full((batch_size * beam_width, 1),
-                                      max_context_length,
+                                      initial_seq_len,
                                       dtype=torch.int32,
                                       device=self.device)
 
@@ -4374,7 +4397,7 @@ class GenerationSession(object):
             hidden_states = torch.zeros((1, max_num_tokens, hidden_size))
 
         # Init KV cache block manager
-        if self.paged_kv_cache and self.has_attn_layers:
+        if self.paged_kv_cache and self.has_attn_layers and not can_reuse_kv:
             num_blocks, max_blocks_per_seq = self._get_num_paged_blocks(
                 self.max_attention_window_size, self.sink_token_length)
 

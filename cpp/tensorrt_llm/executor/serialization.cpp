@@ -874,6 +874,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto requestType = su::deserialize<executor::RequestType>(is);
     auto contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     auto encoderInputFeatures = su::deserialize<std::optional<Tensor>>(is);
+    auto encoderOutput = su::deserialize<std::optional<Tensor>>(is);
     auto encoderOutputLength = su::deserialize<std::optional<SizeType32>>(is);
     auto crossAttentionMask = su::deserialize<std::optional<Tensor>>(is);
     auto numReturnSequences = su::deserialize<SizeType32>(is);
@@ -894,7 +895,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
         std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
+        std::move(contextPhaseParams), std::move(encoderInputFeatures), std::move(encoderOutput), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
         std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }

@@ -1581,6 +1581,10 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                             mEncoderModel->getHiddenSize() * mEncoderModel->getWorldConfig().getTensorParallelism(),
                             mEncoderModel->getLogitDataType());
                     }
+                    if (newReq->hasPrecomputedEncoderOutput())
+                    {
+                        newReq->applyPrecomputedEncoderOutput(mEncoderModel->getBufferManager());
+                    }
                 }
 
                 if (!mEncoderModel && newReq->getEncoderInputFeatures())

@@ -672,8 +672,19 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                         }
                         else // GPT / ChatGLM2-6B / ChatGLM3-6B / BART
                         {
-                            // positionIds is just the size of tokens -1
-                            positionIdsHost.push_back(numTokens - 1);
+                            if (draftLength > 0)
+                            {
+                                // External draft verification feeds draftLength + 1 tokens per step.
+                                for (SizeType32 pi = 0; pi < draftLength + 1; ++pi)
+                                {
+                                    positionIdsHost.push_back(numTokens - 1 + pi);
+                                }
+                            }
+                            else
+                            {
+                                // positionIds is just the size of tokens -1
+                                positionIdsHost.push_back(numTokens - 1);
+                            }
                         }
                     }
                 }

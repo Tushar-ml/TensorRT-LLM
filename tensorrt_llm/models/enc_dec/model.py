@@ -34,12 +34,14 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  FusedGatedMLP, GatedMLP, GroupNorm,
                                  KeyValueCacheParams, LanguageAdapter,
                                  LanguageAdapterConfig, LayerNorm, LoraParams,
-                                 PromptTuningEmbedding, RmsNorm)
+                                 PromptTuningEmbedding, RmsNorm,
+                                 SpecDecodingParams)
 # yapf: enable
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules,
                                       use_lora)
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, PretrainedModel
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
@@ -494,7 +496,8 @@ class DecoderLayer(Module):
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
                 cross_kv_reuse: Optional[Tensor] = None,
-                language_adapter_routings: Optional[Tensor] = None):
+                language_adapter_routings: Optional[Tensor] = None,
+                spec_decoding_params: Optional[SpecDecodingParams] = None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -512,7 +515,8 @@ class DecoderLayer(Module):
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_layer_params=lora_layer_params)
+            lora_layer_params=lora_layer_params,
+            spec_decoding_params=spec_decoding_params)
 
         if use_cache:
             attention_output, presents_self = attention_output
@@ -1226,7 +1230,8 @@ class DecoderModel(PretrainedModel):
                 lora_params: LoraParams = None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
                 cross_kv_reuse: Optional[Tensor] = None,
-                language_adapter_routings: Optional[Tensor] = None):
+                language_adapter_routings: Optional[Tensor] = None,
+                spec_decoding_params: Optional[SpecDecodingParams] = None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -1288,7 +1293,8 @@ class DecoderModel(PretrainedModel):
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
                 cross_kv_reuse=cross_kv_reuse,
-                language_adapter_routings=language_adapter_routings)
+                language_adapter_routings=language_adapter_routings,
+                spec_decoding_params=spec_decoding_params)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1347,6 +1353,9 @@ class DecoderModel(PretrainedModel):
                        gather_context_logits: bool = False,
                        lora_target_modules: List[str] = None,
                        use_cache=True,
+                       max_draft_len: int = 0,
+                       speculative_decoding_draft_tokens_external: bool = False,
+                       spec_decoding_is_generation_length_variable: bool = False,
                        *args,
                        **kwargs):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
@@ -1372,9 +1381,21 @@ class DecoderModel(PretrainedModel):
         ]
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
         beam_width_range = [1, (max_beam_width + 1) // 2, max_beam_width]
+
+        tokens_per_engine_step = max_draft_len + 1 if max_draft_len > 0 else 1
+        tokens_per_engine_step_range = [
+            1, tokens_per_engine_step, tokens_per_engine_step
+        ]
+        bbd_range = [
+            bb_range[0],
+            bb_range[1] * tokens_per_engine_step,
+            bb_range[2] * tokens_per_engine_step,
+        ]
+
         inlen_range = [
-            1, 1, max_decoder_input_len
-        ]  # context phase >= 1 (if forced_input_ids), generation phase = 1
+            1, 1,
+            max(max_decoder_input_len, tokens_per_engine_step)
+        ]  # context phase >= 1, generation phase up to draft_len+1
         encoder_inlen_range = [
             1, (max_encoder_input_len + 1) // 2, max_encoder_input_len
         ]
@@ -1390,7 +1411,8 @@ class DecoderModel(PretrainedModel):
             1,
             max_batch_size * max_beam_width,
             max(max_decoder_input_len * max_batch_size,
-                max_beam_width * max_batch_size),
+                max_beam_width * max_batch_size,
+                max_batch_size * max_beam_width * tokens_per_engine_step),
         ]
 
         # No enable_two_optimization_profiles support yet
@@ -1594,13 +1616,78 @@ class DecoderModel(PretrainedModel):
 
         last_token_ids = None
         if self.mapping.is_last_pp_rank() and not gather_context_logits:
-            last_token_ids = Tensor(
-                name="last_token_ids",
+            if not remove_input_padding and max_draft_len > 0:
+                last_token_ids = Tensor(
+                    name="last_token_ids",
+                    dtype=trt.int32,
+                    shape=[-1, -1],
+                    dim_range=OrderedDict([
+                        ("batch_size_beam_width", [bb_range]),
+                        ("last_token_ids", [tokens_per_engine_step_range]),
+                    ]),
+                )
+            else:
+                last_token_ids = Tensor(
+                    name="last_token_ids",
+                    dtype=trt.int32,
+                    shape=[-1],
+                    dim_range=OrderedDict([(
+                        "batch_size_last_token_ids",
+                        [bbd_range] if max_draft_len > 0 else [bb_range],
+                    )]),
+                )
+
+        spec_decoding_params = None
+        if speculative_decoding_draft_tokens_external == False and max_draft_len > 0:
+            num_packed_masks = (tokens_per_engine_step + 32 - 1) // 32
+            packed_mask_len_range = [[0, 1, num_packed_masks]]
+            num_gen_tokens_range = [
+                GenerationMixin.default_range(
+                    max_batch_size * max_beam_width * tokens_per_engine_step,
+                    min_range=0)
+            ]
+            bb_range_0 = [[0] + bbr[1:] for bbr in [bb_range]]
+
+            spec_decoding_generation_lengths = Tensor(
+                name='spec_decoding_generation_lengths',
                 dtype=trt.int32,
                 shape=[-1],
-                dim_range=OrderedDict([("batch_size_last_token_ids", [bb_range])
-                                       ]),
+                dim_range=OrderedDict(
+                    [('batch_size_beam_width_0', bb_range_0)]),
             )
+            spec_decoding_position_offsets = Tensor(
+                name='spec_decoding_position_offsets',
+                dtype=trt.int32,
+                shape=[-1, -1],
+                dim_range=OrderedDict([
+                    ('batch_size_beam_width_0', bb_range_0),
+                    ('spec_decoding_position_ids_dim0',
+                     [tokens_per_engine_step_range]),
+                ]),
+            )
+            spec_decoding_packed_mask = Tensor(
+                name='spec_decoding_packed_mask',
+                dtype=trt.int32,
+                shape=[-1, -1],
+                dim_range=OrderedDict([
+                    ('spec_decoding_packed_mask_dim0', num_gen_tokens_range),
+                    ('spec_decoding_packed_mask_dim1', packed_mask_len_range),
+                ]),
+            )
+            spec_decoding_use = Tensor(name='spec_decoding_use',
+                                       dtype=trt.int32,
+                                       shape=[1],
+                                       dim_range=OrderedDict(
+                                           [('spec_decoding_use_dim', [1])]))
+            spec_decoding_params = SpecDecodingParams(
+                spec_decoding_is_generation_length_variable=
+                spec_decoding_is_generation_length_variable,
+                spec_decoding_max_generation_length=tokens_per_engine_step,
+                spec_decoding_generation_lengths=
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_use)
 
         if not use_gpt_attention_plugin:
             attention_mask = Tensor(
@@ -2013,6 +2100,7 @@ class DecoderModel(PretrainedModel):
             'cross_kv_cache_gen': cross_kv_cache_gen,
             'cross_kv_reuse': cross_kv_reuse,
             'language_adapter_routings': language_adapter_routings,
+            'spec_decoding_params': spec_decoding_params,
         }
 
         return result

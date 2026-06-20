@@ -611,13 +611,14 @@ void initRequestBindings(nb::module_& m)
             self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(), self.getKvCacheRetentionConfig(),
             self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(),
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
-            self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
+            self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutput(),
+            self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
             self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 35)
+        if (state.size() != 36)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -638,11 +639,11 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<IdType>>(state[22]), nb::cast<bool>(state[23]),
             nb::cast<tle::PriorityType>(state[24]), nb::cast<tle::RequestType>(state[25]),
             nb::cast<std::optional<tle::ContextPhaseParams>>(state[26]),
-            nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
-            nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
-            nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
+            nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<tle::Tensor>>(state[28]),
+            nb::cast<std::optional<SizeType32>>(state[29]), nb::cast<std::optional<tle::Tensor>>(state[30]), 1,
+            nb::cast<std::optional<tle::EagleConfig>>(state[31]), nb::cast<std::optional<tle::Tensor>>(state[32]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[33]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[34]), nb::cast<std::optional<std::string>>(state[35]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
@@ -675,6 +676,7 @@ void initRequestBindings(nb::module_& m)
                  tle::RequestType,                              // type
                  std::optional<tle::ContextPhaseParams>,        // contextPhaseParams
                  std::optional<tle::Tensor>,                    // encoderInputFeatures
+                 std::optional<tle::Tensor>,                    // encoderOutput
                  std::optional<tle::SizeType32>,                // encoderOutputLength
                  std::optional<tle::Tensor>,                    // crossAttentionMask
                  SizeType32,                                    // numReturnSequences
@@ -716,6 +718,7 @@ void initRequestBindings(nb::module_& m)
         nb::arg("type") = tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         nb::arg("context_phase_params") = nb::none(),
         nb::arg("encoder_input_features") = nb::none(),
+        nb::arg("encoder_output") = nb::none(),
         nb::arg("encoder_output_length") = nb::none(),
         nb::arg("cross_attention_mask") = nb::none(),
         nb::arg("num_return_sequences") = 1,
@@ -761,6 +764,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
+        .def_prop_rw("encoder_output", &tle::Request::getEncoderOutput, &tle::Request::setEncoderOutput)
         .def_prop_rw("cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
         .def_prop_rw("eagle_config", &tle::Request::getEagleConfig, &tle::Request::setEagleConfig)
         .def_prop_rw(

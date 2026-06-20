@@ -353,7 +353,12 @@ public:
             mReturnGenerationLogits = false;
         }
 
-        if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
+        if (req.getEncoderOutput().has_value())
+        {
+            mState = LlmRequestState::kCONTEXT_INIT;
+            mPrecomputedEncoderOutput = executor::detail::toITensor(req.getEncoderOutput().value());
+        }
+        else if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
         {
             mState = LlmRequestState::kENCODER_INIT;
             if (req.getEncoderInputTokenIds().has_value())
@@ -676,6 +681,14 @@ public:
         if (getEncoderTokens().has_value())
         {
             return getEncoderTokens().value()->size();
+        }
+        if (mEncoderOutputLength.has_value())
+        {
+            return mEncoderOutputLength.value();
+        }
+        if (mPrecomputedEncoderOutput)
+        {
+            return mPrecomputedEncoderOutput->getShape().d[0];
         }
 
         return std::nullopt;
@@ -1321,6 +1334,24 @@ public:
     [[nodiscard]] TensorPtr const& getEncoderOutput() const noexcept
     {
         return mEncoderOutput;
+    }
+
+    [[nodiscard]] bool hasPrecomputedEncoderOutput() const noexcept
+    {
+        return static_cast<bool>(mPrecomputedEncoderOutput);
+    }
+
+    void applyPrecomputedEncoderOutput(runtime::BufferManager const& manager)
+    {
+        if (!mPrecomputedEncoderOutput)
+        {
+            return;
+        }
+        auto const encOutLen = getEncoderOutputLen();
+        mEncoderOutput->reshape(
+            runtime::ITensor::makeShape({encOutLen, mPrecomputedEncoderOutput->getShape().d[1]}));
+        manager.copy(*mPrecomputedEncoderOutput, *mEncoderOutput);
+        mPrecomputedEncoderOutput.reset();
     }
 
     [[nodiscard]] TensorPtr const& getEncoderHiddenStates() const noexcept
@@ -2152,6 +2183,7 @@ protected:
     TensorPtr mEncoderOutput;       // [numTokens, hidden_size]
     TensorPtr mEncoderHiddenStates; // [numTokens, hiddenSize] for for Pipeline-Parallelism
     TensorPtr mEncoderOutputHost;   // [mEncoderOutputLength, encoderHiddenSize]
+    TensorPtr mPrecomputedEncoderOutput;
 
     SizeType32 mDecodingIter{0};
 

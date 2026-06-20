@@ -4391,6 +4391,10 @@ void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLen
         }
     }
 
+    // Cross-attention KV is stored in a separate manager and is not rewound here.
+    TLLM_CHECK_WITH_INFO(!isCrossKv(),
+        "rewindKVCache must only be called on the decoder self-attention KV cache manager");
+
     for (SizeType32 si = 0; si < rewindLengths; ++si)
     {
         removeToken(requestId);
