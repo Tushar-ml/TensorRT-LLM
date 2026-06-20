@@ -27,9 +27,16 @@
 using CacheElem = ElemType<CACHE_ELEM_ENUM>;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
 constexpr bool isMLA = IS_MLA;
-static_assert((isMLA || validElemsPerHead <= 256) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
-constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576, "not implemented");
+// head_size 512 (Gemma4 global-attention layers) is supported for the spec-dec generation path only,
+// and only via the SWAP_AB=1 variant (SPEC_Q_SEQ_LEN defined) which omits the headElems-scaled VTBuffer
+// that would otherwise overflow SMEM at 512.  The MLA path already proves a 576-wide head fits.
+static_assert((isMLA || validElemsPerHead <= 512) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
+constexpr uint32_t headElems = validElemsPerHead <= 64
+    ? 64
+    : (validElemsPerHead <= 128 ? 128 : (validElemsPerHead <= 256 ? 256 : (isMLA ? 576 : 512)));
+static_assert(
+    headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 || headElems == 576,
+    "not implemented");
 // Number of head elements RoPE is applied to. Equals validElemsPerHead for full rotary; smaller for
 // partial rotary, in which case [validRopeElemsPerHead, validElemsPerHead) is passed through unrotated.
 constexpr uint32_t validRopeElemsPerHead = ROPE_ELEMS;
