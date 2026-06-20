@@ -358,10 +358,12 @@ class WhisperDecoding:
         if force_reset:
             self.rewind_draft_session()
 
+        batch_size = int(decoder_input_ids.shape[0])
         prefix_len = int(decoder_input_ids.shape[-1])
         past_len = (self._draft_committed_prefix_len
                     if self._draft_session_active else 0)
-        full_reset = (not self._draft_session_active or prefix_len < past_len)
+        full_reset = (not self._draft_session_active or prefix_len < past_len
+                      or batch_size > 1)
 
         if full_reset:
             past_len = 0

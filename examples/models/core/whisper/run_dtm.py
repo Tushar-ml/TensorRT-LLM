@@ -552,6 +552,7 @@ class DTMSession:
         self.encoder_max_input_length = None
         self.encoder_outputs = None
         self.encoder_output_lengths = None
+        self._runs_done = 0
         self._encode_target_once()
 
     def _encode_target_once(self):
@@ -566,13 +567,35 @@ class DTMSession:
                                              self.args.ngram_max_matching_size,
                                              end_id)
 
+    def _reset_for_new_run(self, draft_len, end_id):
+        """Reset draft/target state between full transcription passes."""
+        if isinstance(self.draft_decoder, PersistentWhisperDraftDecoder):
+            self.draft_decoder.reset_session()
+        runtime_rank = tensorrt_llm.mpi_rank()
+        _, self.target_runner = _build_runners(
+            self.args,
+            self.draft_device_list,
+            self.target_device_list,
+            runtime_rank,
+            self.mel,
+            self.mel_input_lengths,
+            batch_size=self.batch_size,
+            identical_batch=self.identical_batch,
+        )
+        if self.args.draft_mode in ('ngram', 'hybrid'):
+            self.setup_ngram_pool(draft_len, end_id)
+        else:
+            self.ngram_pool = None
+
     def run(self, draft_len, end_id, profile=False, sync_identical_batch=False,
             batched_target_verify=None):
         if batched_target_verify is None:
             batched_target_verify = _resolve_batched_target_verify(
                 self.args, self.batch_size)
-        if self.ngram_pool is None:
-            self.setup_ngram_pool(draft_len, end_id)
+        self.end_id = end_id
+        if self._runs_done > 0:
+            self._reset_for_new_run(draft_len, end_id)
+        self._runs_done += 1
         start = time.time()
         output_ids, stats = run_whisper_dtm(
             self.prefix,
