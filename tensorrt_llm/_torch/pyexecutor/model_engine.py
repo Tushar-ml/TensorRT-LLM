@@ -37,7 +37,6 @@ from tensorrt_llm.mapping import CpType, Mapping
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
-from ..attention_backend.flashinfer import FlashInferAttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
@@ -2133,8 +2132,7 @@ class PyTorchModelEngine(ModelEngine):
 
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'],
-                              (TrtllmAttentionMetadata,
-                               FlashInferAttentionMetadata)):
+                              TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -

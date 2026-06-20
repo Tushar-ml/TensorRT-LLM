@@ -419,22 +419,16 @@ def create_py_executor(
         gemma4_shared_kv_mtp = (
             model_cls is not None
             and getattr(model_cls, "uses_shared_backbone_kv_for_mtp", False))
-        if (llm_args.attn_backend == "TRTLLM" and gemma4_shared_kv_mtp
-                and not _trtllm_mmha_supports_head_dim_512()):
+        if gemma4_shared_kv_mtp and not _trtllm_mmha_supports_head_dim_512():
             raise ValueError(
                 "TRTLLM attention does not support Gemma4 global attention layers "
-                "(head_dim=512) on this GPU: MMHA/XQA rejects head_dim 512. Use "
-                "attn_backend='FLASHINFER' for Gemma4 MTP on Hopper.")
-        if llm_args.attn_backend == "FLASHINFER" and not gemma4_shared_kv_mtp:
+                "(head_dim=512) on this GPU: MMHA/XQA rejects head_dim 512. "
+                "Gemma4 MTP requires Hopper (SM90) or Blackwell (SM100/SM103).")
+        if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine "
                 f"speculative decoding mode '{spec_config.spec_dec_mode.name}'. "
                 f"Please use attn_backend='TRTLLM'.")
-        elif llm_args.attn_backend == "FLASHINFER" and gemma4_shared_kv_mtp:
-            logger.info(
-                "Using FLASHINFER for Gemma4 one-engine MTP: native fa2 paged "
-                "prefill supports head_dim=512 and multi-token verification."
-            )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
