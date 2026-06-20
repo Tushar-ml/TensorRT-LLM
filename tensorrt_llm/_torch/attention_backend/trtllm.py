@@ -1784,15 +1784,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.output = outputs[0]
             forward_args.output_sf = outputs[1] if len(outputs) == 2 else None
 
-        forward_args.is_fused_qkv = not metadata.is_cross and k is None
-        forward_args.update_kv_cache = not metadata.is_cross or k is not None
+        # Cross-layer KV sharing (e.g. Gemma4 KV-shared layers): a Q-only layer
+        # whose K/V live in another layer's cache slot (self.layer_idx already
+        # points there).  q is Q-only (not fused) and the current token's K/V was
+        # written by the owning layer earlier this forward, so do not treat it as
+        # fused-QKV and do not re-append KV here.
+        kv_shared_no_append = getattr(self, "kv_shared_no_append", False)
+        forward_args.is_fused_qkv = (not metadata.is_cross and k is None
+                                     and not kv_shared_no_append)
+        forward_args.update_kv_cache = ((not metadata.is_cross or k is not None)
+                                        and not kv_shared_no_append)
         has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
         has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
                           and v is not None)
         uses_cached_cross_kv = (metadata.is_cross
                                 and not forward_args.update_kv_cache
                                 and k is None and v is None)
-        assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
+        # Cross-layer KV sharing (Gemma4): Q-only self-attention reading another
+        # layer's cache slot (self.layer_idx), no KV append this layer.
+        uses_cached_self_kv = (kv_shared_no_append and not metadata.is_cross
+                               and k is None and v is None)
+        assert (has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
+                or uses_cached_self_kv)
         if forward_args.cu_q_seqlens is None:
             forward_args.cu_q_seqlens = metadata.cu_q_seqlens
         if forward_args.cu_kv_seqlens is None:

@@ -289,6 +289,14 @@ class Gemma4Attention(QKNormRoPEAttention):
         if cache_layer_idx is not None and cache_layer_idx != layer_idx:
             self.attn.layer_idx = cache_layer_idx
 
+        # KV shared layers are Q-only: the target layer already wrote the current
+        # token's K/V into cache_layer_idx earlier in the same forward, so this
+        # layer must NOT be treated as fused-QKV and must NOT re-append KV.  Tell
+        # the attention backend so it sets is_fused_qkv / update_kv_cache = False
+        # (see TrtllmAttention.forward).
+        if is_kv_shared:
+            self.attn.kv_shared_no_append = True
+
         # KV shared layers: replace fused QKV with Q-only projection.
         # HF doesn't create k/v for shared layers, so we match that.
         #
