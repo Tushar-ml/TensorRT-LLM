@@ -26,7 +26,10 @@ def main():
         ids = tok.apply_chat_template(
             [{"role": "user", "content": p}],
             add_generation_prompt=True,
-            return_tensors="pt").to(model.device)
+            return_tensors="pt")
+        if not torch.is_tensor(ids):
+            ids = ids["input_ids"]
+        ids = ids.to(model.device)
         with torch.inference_mode():
             out = model.generate(ids, max_new_tokens=40, do_sample=False)
         gen = out[0][ids.shape[1]:]

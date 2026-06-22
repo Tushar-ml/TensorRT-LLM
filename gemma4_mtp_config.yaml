@@ -1,0 +1,59 @@
+# Gemma4 MTP (Multi-Token Prediction) speculative decoding config
+#
+# Usage:
+#   trtllm-serve <backbone_model> --config gemma4_mtp_config.yaml
+#
+# Or with Python LLM API:
+#   from tensorrt_llm.llmapi import LLM, MTPDecodingConfig
+#   llm = LLM(
+#       model="google/gemma-4-27b-it",
+#       speculative_config=MTPDecodingConfig(
+#           max_draft_len=1,
+#           speculative_model="google/gemma-4-27b-it-assistant",
+#           mtp_eagle_one_model=True,
+#       ),
+#   )
+
+# ── Model ────────────────────────────────────────────────────────────────────
+# Replace with your local path or HF model ID.
+# Supported sizes: gemma-4-9b-it, gemma-4-27b-it
+# model: google/gemma-4-27b-it
+
+# ── Speculative decoding ──────────────────────────────────────────────────────
+speculative_config:
+  decoding_type: MTP
+
+  # Path or HF ID of the Gemma4 assistant (draft) model.
+  # The assistant checkpoint is a separate model with architecture
+  # "gemma4_assistant" / Gemma4AssistantForCausalLM.
+  speculative_model: google/gemma-4-27b-it-assistant
+
+  # Number of draft tokens to predict per step.
+  # Gemma4 assistant typically yields best throughput at max_draft_len=1.
+  # Increase to 2 if your accept-rate is high (>0.9) and latency budget allows.
+  max_draft_len: 1
+
+  # Use the fast one-engine MTP path (drafter runs as a submodule of the
+  # backbone; no separate model process or KV-cache duplication).
+  # MUST be True for Gemma4 because the assistant uses Q-only attention that
+  # shares the backbone's KV cache.
+  mtp_eagle_one_model: true
+
+# ── Attention backend ─────────────────────────────────────────────────────────
+# FlashInfer is required for Gemma4 (hybrid VSWA + per-layer head_dim 256/512).
+# Requires FlashInfer >= 0.6.13 with fa2 hd512 kernels (PR #3576+#3652).
+# Keep cuda_graph_config: null until decode graphs are validated on Hopper.
+attn_backend: FLASHINFER
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+# Adjust to your GPU count. Gemma4-27B fits in 4 × A100-80G with TP=4.
+# tensor_parallel_size: 4
+
+# ── KV cache ─────────────────────────────────────────────────────────────────
+# Optional: cap pool to avoid OOM during first load.
+# kv_cache_config:
+#   free_gpu_memory_fraction: 0.85
+
+# ── Sequence length ───────────────────────────────────────────────────────────
+max_seq_len: 8192
+max_num_tokens: 8192
