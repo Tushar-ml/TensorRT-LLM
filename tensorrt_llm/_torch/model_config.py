@@ -1007,6 +1007,14 @@ def _extract_gemma4_text_pretrained_config(
         parent_dtype = getattr(pretrained_config, "dtype", None)
     if parent_dtype is not None:
         text_only.torch_dtype = parent_dtype
+    # Quantization metadata lives on the top-level multimodal config, not in
+    # ``text_config``. Carry it over so quantized (e.g. FP8) checkpoints are
+    # recognized in text-only mode instead of silently loading as unquantized.
+    parent_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+    if parent_quant_config is not None and getattr(
+            text_only, "quantization_config", None) is None:
+        text_only.quantization_config = parent_quant_config
     logger.info(
         f"Gemma4 text-only mode: extracted language_model config from "
         f"{arch or model_type} (hidden_size={text_only.hidden_size}, "
