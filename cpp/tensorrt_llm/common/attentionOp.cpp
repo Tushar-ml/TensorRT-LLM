@@ -2500,7 +2500,36 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         XQAParams xqaParams{};
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
 
-        if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+        // CUDA-graph correctness for sliding-window (SWA) layers.
+        //
+        // The multi-CTA ("multi-block") XQA decode/spec-dec kernels size their KV-split
+        // CTA count from the runtime history length:
+        //   multiBlockCount = historyLength / kMinHistoryTokensPerBlock   (decoderXQARunner)
+        //   grid            = numKVHeads * batch * multiBlockCount
+        // Under CUDA graph this grid is computed at *capture* time from the warmup KV
+        // (~max_seq) and frozen. At replay with a smaller real KV the extra KV-split CTAs
+        // are phantom; for the cyclic (sliding-window) KV cache their partials feed the
+        // multi-CTA semaphore reduction and corrupt the result (decode garbage). This
+        // only bites layers whose attention window < the model max seq (real SWA), e.g.
+        // Gemma4's hd256 layers once max_seq_len >= sliding_window; full-attention layers
+        // (window == max_seq) are unaffected, and on SM90 the hd512 globals use MMHA.
+        //
+        // Fix: keep the fast XQA kernel but force *single-CTA* XQA (multi_block_mode =
+        // false) for SWA layers. The grid then becomes numKVHeads * batch with no KV-
+        // length dependence, so it is CUDA-graph-safe; eager and full-attention layers
+        // keep multi-block XQA. We can't scope this to "graph capture only" --
+        // cudaStreamIsCapturing is not observable for TRT-LLM's PyTorch CG capture here --
+        // so single-CTA XQA also applies to eager SWA decode (still far faster than the
+        // MMHA fallback). GEMMA4_NO_XQA_SWA=1 forces the MMHA path entirely as an escape
+        // hatch.
+        bool const is_swa_layer = (mMaxSeqLen > 0) && (params.max_attention_window_size < mMaxSeqLen);
+        static bool const s_no_xqa_swa = std::getenv("GEMMA4_NO_XQA_SWA") != nullptr;
+        if (is_swa_layer)
+        {
+            xqaParams.multi_block_mode = false;
+        }
+        bool const avoid_xqa_for_cuda_graph = is_swa_layer && s_no_xqa_swa;
+        if (mEnableXQA && !avoid_xqa_for_cuda_graph && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             xqaParams.stream = stream;
