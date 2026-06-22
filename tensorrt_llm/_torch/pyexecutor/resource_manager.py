@@ -600,6 +600,25 @@ class KVCacheManager(BaseResourceManager):
                                                       dim=-1)
 
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
+        # Zero-initialize the KV cache pool.
+        #
+        # Under full CUDA graph, sliding-window (SWA) attention layers that run on the
+        # MMHA path read the cyclic KV window, which can include cache slots beyond the
+        # current sequence length (i.e. never-written, uninitialized memory whose access
+        # pattern is baked into the captured graph). Uninitialized values (NaN/Inf) break
+        # the softmax max/sum reduction and corrupt decode -- non-deterministically,
+        # because the stale memory differs per process launch. This bites Gemma4 FP8,
+        # where the SWA layers select MMHA (the bf16 path selects the bounds-correct XQA
+        # kernel and is unaffected). Zeroing the pool once at allocation makes those reads
+        # benign (masked positions contribute zero). One-time startup cost, bandwidth-
+        # bound (~tens of ms). Opt out with TRTLLM_DISABLE_KV_POOL_ZERO_INIT=1.
+        if os.environ.get("TRTLLM_DISABLE_KV_POOL_ZERO_INIT") != "1":
+            try:
+                n_layers = int(self.kv_cache_pool_mapping.shape[0])
+                for _layer_idx in range(n_layers):
+                    self.impl.get_primary_pool_data(_layer_idx).zero_()
+            except Exception as e:
+                logger.warning(f"KV cache pool zero-init skipped: {e}")
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
