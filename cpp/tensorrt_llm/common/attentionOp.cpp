@@ -2512,7 +2512,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // multi-CTA semaphore reduction and corrupt the result (decode garbage). This
         // only bites layers whose attention window < the model max seq (real SWA), e.g.
         // Gemma4's hd256 layers once max_seq_len >= sliding_window; full-attention layers
-        // (window == max_seq) are unaffected, and on SM90 the hd512 globals use MMHA.
+        // (window == max_seq) are unaffected. The hd512 globals (window == max_seq) are not
+        // SWA and on SM90 now use the QGMMA XQA kernel (see supportConfigQGMMA isHd512).
         //
         // Fix: keep the fast XQA kernel but force *single-CTA* XQA (multi_block_mode =
         // false) for SWA layers. The grid then becomes numKVHeads * batch with no KV-
@@ -2521,15 +2522,18 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // cudaStreamIsCapturing is not observable for TRT-LLM's PyTorch CG capture here --
         // so single-CTA XQA also applies to eager SWA decode (still far faster than the
         // MMHA fallback). GEMMA4_NO_XQA_SWA=1 forces the MMHA path entirely as an escape
-        // hatch.
+        // hatch. GEMMA4_NO_XQA_HD512=1 likewise forces hd512 global layers back to MMHA
+        // (A/B and rollback for the plain-hd512 QGMMA path).
         bool const is_swa_layer = (mMaxSeqLen > 0) && (params.max_attention_window_size < mMaxSeqLen);
+        bool const is_hd512_layer = (xqaParams.head_size == 512);
         static bool const s_no_xqa_swa = std::getenv("GEMMA4_NO_XQA_SWA") != nullptr;
+        static bool const s_no_xqa_hd512 = std::getenv("GEMMA4_NO_XQA_HD512") != nullptr;
         if (is_swa_layer)
         {
             xqaParams.multi_block_mode = false;
         }
-        bool const avoid_xqa_for_cuda_graph = is_swa_layer && s_no_xqa_swa;
-        if (mEnableXQA && !avoid_xqa_for_cuda_graph && mXqaDispatcher->shouldUse(xqaParams))
+        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa) || (is_hd512_layer && s_no_xqa_hd512);
+        if (mEnableXQA && !avoid_xqa && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             xqaParams.stream = stream;
