@@ -31,7 +31,8 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.functional import (AllReduceFusionOp, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
@@ -49,7 +50,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
-from ..distributed import allgather
+from ..distributed import AllReduceParams, allgather
 from ..speculative import SpecMetadata
 from ..utils import ActivationType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -621,6 +622,28 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Layer scalar
         self.register_buffer("layer_scalar", torch.ones(1))
 
+        # AllReduce + RMSNorm fusion (matches vLLM's fuse_allreduce_rms).
+        # Gemma4 is sandwich-norm: the post_attention / post_feedforward RMSNorm is
+        # applied to the o_proj / down_proj output BEFORE the residual add, so we fuse
+        # the (row-parallel) projection's TP all-reduce with that norm using the
+        # no-residual RMS_NORM fusion op (one fused kernel instead of all-reduce + norm).
+        # Gemma4 RMSNorm is the plain variant (x_normed * weight, no 1+w), so the stored
+        # norm weight can be passed directly to the fused kernel.  Only valid under pure
+        # TP (the projections actually all-reduce); under AttentionDP the MLP runs per
+        # rank (overridden_tp_size=1, no all-reduce) so the fusion is disabled.
+        #
+        # Default OFF: GPU-validated lossless (token-identical) and CUDA-graph-safe, but
+        # measured THROUGHPUT-NEUTRAL at TP4 C=32 under CUDA graph (1372 vs 1368 tok/s) —
+        # CUDA graph already amortizes the kernel-launch overhead this fusion removes, so
+        # it only helps the eager / non-graph path (~+3% there).  Kept available
+        # (TRTLLM_GEMMA4_AR_FUSION=1) as the basis for the quantized fused variants
+        # (RESIDUAL_RMS_NORM_QUANT_FP8/NVFP4) once an FP8/FP4 path lands.
+        self._ar_fusion = (
+            os.environ.get("TRTLLM_GEMMA4_AR_FUSION", "0") == "1"
+            and model_config.mapping.tp_size > 1
+            and not model_config.mapping.enable_attention_dp
+        )
+
         # MoE block (parallel with dense MLP)
         self.enable_moe_block = getattr(config, "enable_moe_block", False)
         if self.enable_moe_block:
@@ -678,9 +701,20 @@ class Gemma4DecoderLayer(DecoderLayer):
         if hidden_states.dtype != target_dtype:
             hidden_states = hidden_states.to(target_dtype)
 
-        # Self-attention
+        # Self-attention.  Under pure TP, fuse the o_proj all-reduce with the
+        # post_attention_layernorm (applied to the o_proj output before the residual
+        # add) into one kernel via the no-residual RMS_NORM fusion op.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        attn_all_reduce_params = (
+            AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.post_attention_layernorm.weight,
+                eps=self.post_attention_layernorm.variance_epsilon,
+            )
+            if self._ar_fusion
+            else None
+        )
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -689,15 +723,33 @@ class Gemma4DecoderLayer(DecoderLayer):
             if attention_mask_data is not None
             else PredefinedAttentionMask.CAUSAL,
             attention_mask_data=attention_mask_data,
+            all_reduce_params=attn_all_reduce_params,
             **kwargs,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if not self._ar_fusion:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Feed-forward (dense MLP + optional MoE in parallel)
+        # Feed-forward (dense MLP + optional MoE in parallel).  Fuse the down_proj
+        # all-reduce with post_feedforward_layernorm only on the dense (non-MoE) path;
+        # the MoE path combines MLP+MoE before that norm, so it must stay separate.
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, lora_params=lora_params)
+        mlp_fuse = self._ar_fusion and not self.enable_moe_block
+        mlp_all_reduce_params = (
+            AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.post_feedforward_layernorm.weight,
+                eps=self.post_feedforward_layernorm.variance_epsilon,
+            )
+            if mlp_fuse
+            else None
+        )
+        hidden_states = self.mlp(
+            hidden_states,
+            lora_params=lora_params,
+            final_all_reduce_params=mlp_all_reduce_params,
+        )
 
         if self.enable_moe_block:
             # MLP path: post-norm the MLP output
@@ -719,7 +771,10 @@ class Gemma4DecoderLayer(DecoderLayer):
             # Combine MLP + MoE
             hidden_states = hidden_states_mlp + hidden_states_moe
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        # When mlp_fuse is set the down_proj already applied post_feedforward_layernorm
+        # via the fused all-reduce; otherwise apply it here (MoE path or fusion disabled).
+        if not mlp_fuse:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Per-Layer Embedding (PLE) injection
