@@ -1006,7 +1006,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             weight_scale = load_weight_shard(weights[0][scale_name],
                                              module.tp_size, module.tp_rank,
                                              module.tp_mode)
-            copy_weight(module.weight_scale, weight_scale)
+            # Per-channel FP8 weight scales are 1-D ``[out_features]`` here, but
+            # compressed-tensors (llm-compressor) emits them as ``[out, 1]``.
+            # Flatten so the copy into the 1-D ``weight_scale`` buffer does not
+            # broadcast into a 2-D shape.
+            copy_weight(module.weight_scale, weight_scale.reshape(-1))
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
             module.inv_input_scale.data = 1.0 / module.input_scale
@@ -1033,8 +1037,10 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             if scale is not None:
                 shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                     shard_key]
-                copy_weight_shard(module.weight_scale, scale, shard_offset,
-                                  shard_size)
+                # Flatten compressed-tensors ``[out, 1]`` per-channel scales to
+                # 1-D before copying into the fused 1-D ``weight_scale`` buffer.
+                copy_weight_shard(module.weight_scale, scale.reshape(-1),
+                                  shard_offset, shard_size)
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -1056,8 +1062,8 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             if scale is not None:
                 shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                     shard_key]
-                copy_weight_shard(module.weight_scale, scale, shard_offset,
-                                  shard_size)
+                copy_weight_shard(module.weight_scale, scale.reshape(-1),
+                                  shard_offset, shard_size)
 
 
 class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):

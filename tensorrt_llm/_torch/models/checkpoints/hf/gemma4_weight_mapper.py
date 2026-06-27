@@ -305,7 +305,18 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                     k_key = key_tmpl.format(layer_idx, "k")
                     v_key = key_tmpl.format(layer_idx, "v")
                     if k_key in weights and v_key not in weights:
-                        weights[v_key] = weights[k_key]
+                        # K=V layers omit v_proj entirely. Duplicate ALL k_proj
+                        # tensors into v_proj, not just ``.weight`` — quantized
+                        # checkpoints (e.g. FP8) also carry ``weight_scale`` /
+                        # ``weight_scale_inv`` / ``input_scale`` which must be
+                        # copied too, otherwise v_proj loads with an
+                        # uninitialized scale and produces garbage.
+                        k_prefix = k_key[:-len("weight")]  # ...k_proj.
+                        v_prefix = v_key[:-len("weight")]  # ...v_proj.
+                        for kk in [x for x in weights if x.startswith(k_prefix)]:
+                            vk = v_prefix + kk[len(k_prefix):]
+                            if vk not in weights:
+                                weights[vk] = weights[kk]
 
         # KV shared layers: HF omits k_proj/v_proj for shared layers.
         # The model uses Q-only projection for these layers, so no dummy
