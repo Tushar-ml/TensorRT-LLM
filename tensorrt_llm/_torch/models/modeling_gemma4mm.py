@@ -722,7 +722,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        # The text decoder must use the SAME attention backend the engine builds
+        # metadata for (engine default is TRTLLM); forcing FLASHINFER here makes
+        # the text attention read a TrtllmAttentionMetadata that lacks
+        # FlashInfer-only fields (e.g. ``kv_layout``) and crashes. The TRTLLM
+        # backend is the validated Gemma4 hd512 path. Vision/audio towers keep
+        # TRTLLM.
+        preferred_backend = (model_config.attn_backend
+                             if name == "text_config" else "TRTLLM")
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,

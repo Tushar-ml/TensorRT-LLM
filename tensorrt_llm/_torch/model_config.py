@@ -641,15 +641,6 @@ class ModelConfig(Generic[TConfig]):
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
                 )
 
-        gemma4_text_only = kwargs.pop('gemma4_text_only', None)
-        if gemma4_text_only is None:
-            gemma4_text_only = os.environ.get(
-                "TRTLLM_GEMMA4_TEXT_ONLY", "0").lower() in ("1", "true",
-                                                             "yes")
-        if gemma4_text_only:
-            pretrained_config = _extract_gemma4_text_pretrained_config(
-                pretrained_config, checkpoint_dir)
-
         # Get cached file from path or repo id, return None if not exists.
         def cached_file(path_or_repo_id, file_name):
             try:
@@ -963,63 +954,6 @@ class ModelConfig(Generic[TConfig]):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         return 0
-
-
-def _extract_gemma4_text_pretrained_config(
-        pretrained_config: transformers.PretrainedConfig,
-        checkpoint_dir: str,
-) -> transformers.PretrainedConfig:
-    """Use only ``text_config`` from a Gemma4 multimodal checkpoint.
-
-    Enables serving ``google/gemma-4-31b-it`` (``Gemma4ForConditionalGeneration``)
-    as ``Gemma4ForCausalLM`` for pytorch MTP without loading vision/audio towers.
-    Enable via ``TRTLLM_GEMMA4_TEXT_ONLY=1`` or ``gemma4_text_only=True``.
-    """
-    arch = ((pretrained_config.architectures or [None])[0])
-    model_type = getattr(pretrained_config, "model_type", None)
-    if arch == "Gemma4ForCausalLM" and model_type == "gemma4_text":
-        return pretrained_config
-
-    if arch != "Gemma4ForConditionalGeneration" and model_type != "gemma4":
-        logger.warning_once(
-            f"gemma4_text_only requested but checkpoint architecture is "
-            f"{arch!r} / model_type={model_type!r}; using config as-is.",
-            key="gemma4_text_only_skip",
-        )
-        return pretrained_config
-
-    text_config = getattr(pretrained_config, "text_config", None)
-    if text_config is None:
-        raise ValueError(
-            f"gemma4_text_only requires text_config in {checkpoint_dir}")
-
-    from transformers import Gemma4TextConfig
-
-    if isinstance(text_config, Gemma4TextConfig):
-        text_only = Gemma4TextConfig(**text_config.to_dict())
-    else:
-        text_only = Gemma4TextConfig(**dict(text_config))
-
-    text_only.architectures = ["Gemma4ForCausalLM"]
-    text_only.model_type = "gemma4_text"
-    parent_dtype = getattr(pretrained_config, "torch_dtype", None)
-    if parent_dtype is None:
-        parent_dtype = getattr(pretrained_config, "dtype", None)
-    if parent_dtype is not None:
-        text_only.torch_dtype = parent_dtype
-    # Quantization metadata lives on the top-level multimodal config, not in
-    # ``text_config``. Carry it over so quantized (e.g. FP8) checkpoints are
-    # recognized in text-only mode instead of silently loading as unquantized.
-    parent_quant_config = getattr(pretrained_config, "quantization_config",
-                                  None)
-    if parent_quant_config is not None and getattr(
-            text_only, "quantization_config", None) is None:
-        text_only.quantization_config = parent_quant_config
-    logger.info(
-        f"Gemma4 text-only mode: extracted language_model config from "
-        f"{arch or model_type} (hidden_size={text_only.hidden_size}, "
-        f"num_hidden_layers={text_only.num_hidden_layers})")
-    return text_only
 
 
 def _mirror_text_subconfig_attrs(
