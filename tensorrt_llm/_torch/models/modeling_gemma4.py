@@ -1513,7 +1513,17 @@ class Gemma4MTP(DecoderLayer):
             asst_model_config = dc_replace(model_config,
                                            pretrained_config=asst_pretrained)
         else:
-            asst_model_config = model_config
+            asst_model_config = dc_replace(model_config)
+
+        # The assistant/draft checkpoint has its OWN precision and is independent
+        # of the backbone's quantization.  In particular a bf16 assistant must
+        # NOT inherit an FP8 backbone's quant_config, otherwise the draft
+        # attention/MLP Linears are built quantized and load the bf16 assistant
+        # weights with uninitialized scales -> garbage draft (zero acceptance and
+        # KV/verify corruption).  Reset to an unquantized config; a genuinely
+        # quantized assistant would carry its own quantization_config (not wired
+        # here yet).
+        asst_model_config.quant_config = type(model_config.quant_config)()
 
         # Compute which backbone layer each MTP sub-layer should share KV with.
         # (Uses backbone config for cache_layer_idx.)

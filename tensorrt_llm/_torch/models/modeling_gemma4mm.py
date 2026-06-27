@@ -1054,6 +1054,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             mm_token_type_ids=mm_token_type_ids,
             ple_input_ids=ple_input_ids,
             lora_params=kwargs.get("lora_params", None),
+            # Forward speculative-decoding context so the inner LLM's spec
+            # worker (MTP) can gather logits / run the draft. Without these the
+            # spec path hits ``spec_metadata.gather_ids`` on None.
+            spec_metadata=kwargs.get("spec_metadata", None),
+            resource_manager=kwargs.get("resource_manager", None),
         )
         return logits
 
