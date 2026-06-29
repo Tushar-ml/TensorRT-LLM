@@ -2526,9 +2526,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // grid issue above -- forcing single-CTA (multi_block_mode = false) does not fix it
         // (empirically still garbage), so the corruption is elsewhere in the warp-spec /
         // external-RoPE hd512 path captured at graph-capture time. CUDA graph is on by
-        // default, so route hd512 global layers to the (correct) MMHA decode path by
-        // default. Opt back into the faster QGMMA kernel with GEMMA4_USE_XQA_HD512=1 when
-        // running without CUDA graph.
+        // default, so route *plain* (non-spec-dec) hd512 global decode to the (correct)
+        // MMHA decode path by default. Opt back into the faster QGMMA kernel with
+        // GEMMA4_USE_XQA_HD512=1 when running without CUDA graph.
+        //
+        // Spec-dec (multi_query_tokens, e.g. Gemma4 MTP) hd512 layers are excluded from
+        // this fallback: the spec path has no MMHA kernel (it would hit the "No available
+        // XQA kernels for speculative decoding" check below) and uses the separate spec-dec
+        // QGMMA SWAP_AB kernel, so they must keep XQA.
         bool const is_swa_layer = (mMaxSeqLen > 0) && (params.max_attention_window_size < mMaxSeqLen);
         bool const is_hd512_layer = (xqaParams.head_size == 512);
         static bool const s_no_xqa_swa = std::getenv("GEMMA4_NO_XQA_SWA") != nullptr;
@@ -2537,7 +2542,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         {
             xqaParams.multi_block_mode = false;
         }
-        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa) || (is_hd512_layer && !s_use_xqa_hd512);
+        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa)
+            || (is_hd512_layer && !s_use_xqa_hd512 && !xqaParams.multi_query_tokens);
         if (mEnableXQA && !avoid_xqa && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
