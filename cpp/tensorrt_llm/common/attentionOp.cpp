@@ -2510,29 +2510,34 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // (~max_seq) and frozen. At replay with a smaller real KV the extra KV-split CTAs
         // are phantom; for the cyclic (sliding-window) KV cache their partials feed the
         // multi-CTA semaphore reduction and corrupt the result (decode garbage). This
-        // only bites layers whose attention window < the model max seq (real SWA), e.g.
-        // Gemma4's hd256 layers once max_seq_len >= sliding_window; full-attention layers
-        // (window == max_seq) are unaffected. The hd512 globals (window == max_seq) are not
-        // SWA and on SM90 now use the QGMMA XQA kernel (see supportConfigQGMMA isHd512).
+        // bites layers whose attention window < the model max seq (real SWA), e.g.
+        // Gemma4's hd256 layers once max_seq_len >= sliding_window.
         //
-        // Fix: keep the fast XQA kernel but force *single-CTA* XQA (multi_block_mode =
+        // SWA fix: keep the fast XQA kernel but force *single-CTA* XQA (multi_block_mode =
         // false) for SWA layers. The grid then becomes numKVHeads * batch with no KV-
-        // length dependence, so it is CUDA-graph-safe; eager and full-attention layers
-        // keep multi-block XQA. We can't scope this to "graph capture only" --
-        // cudaStreamIsCapturing is not observable for TRT-LLM's PyTorch CG capture here --
-        // so single-CTA XQA also applies to eager SWA decode (still far faster than the
-        // MMHA fallback). GEMMA4_NO_XQA_SWA=1 forces the MMHA path entirely as an escape
-        // hatch. GEMMA4_NO_XQA_HD512=1 likewise forces hd512 global layers back to MMHA
-        // (A/B and rollback for the plain-hd512 QGMMA path).
+        // length dependence, so it is CUDA-graph-safe; eager decode keeps multi-block XQA.
+        // We can't scope this to "graph capture only" -- cudaStreamIsCapturing is not
+        // observable for TRT-LLM's PyTorch CG capture here -- so single-CTA XQA also
+        // applies to eager SWA decode (still far faster than the MMHA fallback).
+        // GEMMA4_NO_XQA_SWA=1 forces the MMHA path entirely as an escape hatch.
+        //
+        // hd512 globals: the plain-hd512 QGMMA (Hopper warp-spec) decode kernel is correct
+        // in eager mode but produces garbage under CUDA graph. This is NOT the multi-block
+        // grid issue above -- forcing single-CTA (multi_block_mode = false) does not fix it
+        // (empirically still garbage), so the corruption is elsewhere in the warp-spec /
+        // external-RoPE hd512 path captured at graph-capture time. CUDA graph is on by
+        // default, so route hd512 global layers to the (correct) MMHA decode path by
+        // default. Opt back into the faster QGMMA kernel with GEMMA4_USE_XQA_HD512=1 when
+        // running without CUDA graph.
         bool const is_swa_layer = (mMaxSeqLen > 0) && (params.max_attention_window_size < mMaxSeqLen);
         bool const is_hd512_layer = (xqaParams.head_size == 512);
         static bool const s_no_xqa_swa = std::getenv("GEMMA4_NO_XQA_SWA") != nullptr;
-        static bool const s_no_xqa_hd512 = std::getenv("GEMMA4_NO_XQA_HD512") != nullptr;
+        static bool const s_use_xqa_hd512 = std::getenv("GEMMA4_USE_XQA_HD512") != nullptr;
         if (is_swa_layer)
         {
             xqaParams.multi_block_mode = false;
         }
-        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa) || (is_hd512_layer && s_no_xqa_hd512);
+        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa) || (is_hd512_layer && !s_use_xqa_hd512);
         if (mEnableXQA && !avoid_xqa && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
