@@ -813,14 +813,10 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine, kv_cache_config)
 
-        # When using separate draft KV cache in one-model speculative decoding,
-        # use layer_mask to include only target layers. The draft layers should
-        # only be in the separate draft KV cache manager.
+        # When draft layers share backbone KV or use a separate draft manager,
+        # restrict the main KV cache to backbone layers only.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
-        spec_dec_layer_mask = None
-        if self._should_create_separate_draft_kv_cache():
-            num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
-            spec_dec_layer_mask = [True] * num_target_layers
+        spec_dec_layer_mask = self._target_only_kv_layer_mask(model_engine)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         kv_cache_manager = _create_kv_cache_manager(
@@ -882,6 +878,29 @@ class KvCacheCreator:
             )
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _uses_shared_backbone_kv_for_mtp(self, model_engine) -> bool:
+        if self._speculative_config is None:
+            return False
+        if not self._speculative_config.spec_dec_mode.is_mtp_eagle_one_model():
+            return False
+        return getattr(type(model_engine.model),
+                       "uses_shared_backbone_kv_for_mtp", False)
+
+    def _target_only_kv_layer_mask(
+            self, model_engine: PyTorchModelEngine) -> Optional[List[bool]]:
+        """Layer mask covering only backbone layers in the main KV cache manager.
+
+        Used when draft MTP layers share backbone KV (Gemma4) or live in a
+        separate draft KV cache manager.  Prevents get_pp_layers() from
+        appending speculative layer slots that have no per-layer KV metadata.
+        """
+        if not (self._should_create_separate_draft_kv_cache()
+                or self._uses_shared_backbone_kv_for_mtp(model_engine)):
+            return None
+        num_target_layers = (
+            model_engine.model.model_config.pretrained_config.num_hidden_layers)
+        return [True] * num_target_layers
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1596,8 +1615,22 @@ def _create_kv_cache_manager(
         if (kv_cache_config.max_attention_window is None
                 and sliding_window is not None):
             kv_cache_config = copy.copy(kv_cache_config)
+            needs_vswa = (len(set(head_dim_list)) > 1
+                          or len(set(kv_heads_list)) > 1)
+            # When sliding and full layers share different page sizes (hybrid
+            # head_dim / kv_heads), V2 must see distinct window sizes to
+            # allocate separate pool groups.  Preserve the model's real
+            # sliding_window, but cap it at max_seq_len - 1 so we still split
+            # pools in the degenerate case where sliding_window >= max_seq_len
+            # (common in smoke/unit configs with max_seq_len=128).  Using
+            # max_seq_len - 1 unconditionally would disable sliding-window
+            # eviction and let sliding layers attend beyond their window on
+            # long sequences (wrong outputs).
+            sliding_window_val = (min(int(sliding_window),
+                                      int(max_seq_len) - 1)
+                                  if needs_vswa else int(sliding_window))
             kv_cache_config.max_attention_window = [
-                int(sliding_window)
+                sliding_window_val
                 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]

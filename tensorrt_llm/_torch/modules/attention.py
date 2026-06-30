@@ -991,6 +991,18 @@ class Attention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
+        if getattr(self.attn, "kv_shared_no_append", False) and os.environ.get(
+                "GEMMA4_XQA_DBG") is not None:
+            import sys as _sys
+            print(
+                f"[GEMMA4_XQA_DBG_PY] layer={self.layer_idx} "
+                f"attn_output.shape={tuple(attn_output.shape)} "
+                f"o_proj.in={getattr(self.o_proj, 'in_features', '?')} "
+                f"o_proj.out={getattr(self.o_proj, 'out_features', '?')} "
+                f"contig={attn_output.is_contiguous()} dtype={attn_output.dtype}",
+                file=_sys.stderr,
+                flush=True)
+
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
                                                   all_reduce_params,

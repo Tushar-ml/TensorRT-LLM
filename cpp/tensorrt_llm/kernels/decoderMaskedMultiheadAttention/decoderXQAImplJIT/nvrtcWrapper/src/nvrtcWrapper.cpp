@@ -182,6 +182,15 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["TOKENS_PER_PAGE"] = context->paged_kv_cache ? std::to_string(context->tokens_per_block) : "0";
     macros["HEAD_GRP_SIZE"] = std::to_string(num_q_heads_over_kv);
     macros["M_TILESIZE"] = std::to_string(m_tilesize);
+    // Gemma4 global-attention layers (head_size=512) in spec-dec: force the SWAP_AB=1 variant of the
+    // Hopper warp-spec kernel by defining SPEC_Q_SEQ_LEN.  SWAP_AB=1 omits the headElems-scaled VTBuffer
+    // (V-transpose) that would otherwise overflow SMEM at head_size=512.  Requires a uniform Q seq len
+    // across the batch (q_seq_len = runtime_draft_len + 1) and head_grp_size * q_seq_len <= 32, both
+    // enforced by supportConfigQGMMA's isHd512SpecDec branch.
+    if (context->multi_query_tokens && head_size == 512)
+    {
+        macros["SPEC_Q_SEQ_LEN"] = std::to_string(context->q_seq_len);
+    }
     macros["USE_CUSTOM_BARRIER"] = "1";
     // Sliding window is not supported when spec dec is enabled.
     macros["SLIDING_WINDOW"] = context->multi_query_tokens && context->is_spec_dec_tree ? "0" : "1";
@@ -274,21 +283,25 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
     {
         options_cstr.push_back(option.c_str());
     }
-#ifdef NDEBUG
-    CHECK_NVRTC_ERROR(nvrtcCompileProgram(prog->program, options_cstr.size(), options_cstr.data()));
-#else
+    // Always surface the nvrtc program log on failure (even in NDEBUG builds) —
+    // otherwise an XQA JIT compile error only reports a generic "NVRTC error"
+    // with no diagnostics, which is undebuggable in release.
     auto const err = nvrtcCompileProgram(prog->program, options_cstr.size(), options_cstr.data());
     if (err != NVRTC_SUCCESS)
     {
-        size_t logSize;
-        CHECK_NVRTC_ERROR(nvrtcGetProgramLogSize(prog->program, &logSize));
-        std::string log;
-        log.resize(logSize);
-        CHECK_NVRTC_ERROR(nvrtcGetProgramLog(prog->program, log.data()));
-        printf("nvrtc error log:\n%s\n", log.c_str());
+        size_t logSize = 0;
+        if (nvrtcGetProgramLogSize(prog->program, &logSize) == NVRTC_SUCCESS && logSize > 1)
+        {
+            std::string log;
+            log.resize(logSize);
+            if (nvrtcGetProgramLog(prog->program, log.data()) == NVRTC_SUCCESS)
+            {
+                printf("nvrtc error log:\n%s\n", log.c_str());
+                fflush(stdout);
+            }
+        }
         CHECK_NVRTC_ERROR(err);
     }
-#endif
 
     return TLLM_XQA_JIT_SUCCESS;
 }

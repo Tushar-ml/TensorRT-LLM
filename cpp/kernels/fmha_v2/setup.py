@@ -2197,7 +2197,12 @@ def selected_mask_types(kspec):
             sliding_or_chunked_causal_mask = '0'
             bidirectional_sliding_window_mask = '0'
             custom_mask = '0'
-        # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
+        # Regular (non-MLA) head_size=512 (Gemma4 global attention): needs causal +
+        # sliding-window masking across all context input layouts. Drop padding mask
+        # (not used for this path). This must come before the per-layout dispatch below
+        # (which would otherwise disable causal/sliding masks for CONTIGUOUS_Q_KV).
+        elif kspec.head_size == 512 and kspec.head_size_v == 0:
+            padding_mask = '0'
         elif kspec.input_layout == InputLayout.PACKED_QKV:
             # NOTE: 72/80 are added for vision transformer
             if kspec.head_size not in [32, 64, 72, 80, 128]:
@@ -5223,6 +5228,30 @@ def enumerate_hmma_paged_kv_flash_kernels(specs, sm=80, dtype='fp16'):
                                           enable_attn_logit_softcapping)
 
 
+# Regular (non-MLA) head_size=512 (head_size_v=0) HMMA-fallback flash kernels for SM90.
+# Gemma4's global-attention layers use head_dim=512 (Q/K/V all 512). The warp-specialized HGMMA path
+# (enumerate_hgmma_flash_warpspec_kernels) does not cover head_size=512, so we emit the
+# Ampere-style HMMA flash kernel compiled for sm90 as a functional fallback.
+# We restrict the head-size enumeration to 512 only (via head_size_filter) so we do NOT
+# accidentally emit the full 16..256 head-size range in the CONTIGUOUS_Q_KV / Q_PAGED_KV
+# layouts on sm90 (those are otherwise covered by the warp-specialized path).
+# Gemma4 needs: bf16, causal + sliding-window masking, NO attn-logit-softcapping, NO alibi.
+def enumerate_hmma_512_flash_kernels(specs, sm=90, dtype='bf16'):
+    # TRT-LLM context FMHA uses these layouts: PACKED_QKV (packed qkv),
+    # CONTIGUOUS_Q_KV (contiguous q + contiguous kv) and Q_PAGED_KV (paged kv cache).
+    for input_layout in [
+            InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
+            InputLayout.Q_PAGED_KV
+    ]:
+        # No attn-logit-softcapping for Gemma4 global attention.
+        enumerate_hmma_flash_kernels_base(specs,
+                                          sm,
+                                          dtype,
+                                          input_layout,
+                                          enable_attn_logit_softcapping=False,
+                                          head_size_filter=[512])
+
+
 def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
     input_layouts = [
         InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV,
@@ -5245,7 +5274,11 @@ def enumerate_hmma_flash_kernels_base(specs,
                                       dtype='fp16',
                                       input_layout=InputLayout.PACKED_QKV,
                                       enable_attn_logit_softcapping=False,
-                                      head_size_v=0):
+                                      head_size_v=0,
+                                      head_size_filter=None):
+    # head_size_filter: optional list of head sizes to restrict enumeration to.
+    # Used to emit only the head_size=512 fallback on sm90 without pulling in the
+    # full default head-size range for the given input layout(s).
     #- FP16 Flash Attention (use nl as default)
     # Any Sequence Length H = 16/32/40/48/64/80/128/160/256/512 flash attention
 
@@ -5285,6 +5318,8 @@ def enumerate_hmma_flash_kernels_base(specs,
     }
     for head_size, [q_loop_step,
                     kv_loop_step] in tiled_params_q_kv_step.items():
+        if head_size_filter is not None and head_size not in head_size_filter:
+            continue
         if sm_mma == 80:
             specs.append(
                 kernel_spec(
@@ -5320,6 +5355,8 @@ def enumerate_hmma_flash_kernels_base(specs,
     for head_size in [
             16, 32, 40, 48, 64, 72, 80, 96, 104, 128, 160, 192, 256, 512
     ]:
+        if head_size_filter is not None and head_size not in head_size_filter:
+            continue
         if sm == 70 and (head_size > 256 or head_size == 16):
             continue
         # TODO: test head_size=512 on sm75
@@ -6779,6 +6816,11 @@ def enumerate_kernels():
     enumerate_hmma_paged_kv_flash_kernels(specs, sm=90, dtype='fp16')
     enumerate_hmma_paged_kv_flash_kernels(specs, sm=90, dtype='bf16')
 
+    # SM 90 regular (non-MLA) head_size=512 HMMA-fallback flash kernels (Gemma4 global attention).
+    # bf16 is what Gemma4 needs; fp16 added for completeness/symmetry.
+    enumerate_hmma_512_flash_kernels(specs, sm=90, dtype='fp16')
+    enumerate_hmma_512_flash_kernels(specs, sm=90, dtype='bf16')
+
     if 'ENABLE_SM100' in os.environ:
         # SM 100
         enumerate_hmma_flash_kernels(specs, sm=100, dtype='fp16')
@@ -6911,6 +6953,24 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
+                  # Gemma4 global attention: regular (non-MLA) head_size=512 HMMA-fallback
+                  # flash kernels on sm90. head_size_v == 0 distinguishes these from MLA 576/512.
+                  # Use the tiled variant (higher precedence; kv_step=64). All TRT-LLM context
+                  # input layouts (packed / contiguous / paged) are allowed.
+                  or (kspec.sm            == 90
+                  and kspec.dtype         in ['fp16', 'bf16']
+                  and kspec.head_size     == 512
+                  and kspec.head_size_v   == 0
+                  and kspec.input_layout in [InputLayout.PACKED_QKV,
+                                             InputLayout.CONTIGUOUS_Q_KV,
+                                             InputLayout.Q_PAGED_KV]
+                  and kspec.sage_block_sizes is None
+                  and kspec.version       == 2
+                  and kspec.cross_mha     == False
+                  and kspec.flash_attention == True
+                  and kspec.warp_specialization == False
+                  and kspec.enable_attn_logit_softcapping == False
+                  and kspec.tiled == True)
                   # Deepseek MLA (generation 576/512 paged)
                   or (kspec.sm            in [90, 100, 120]
                   and kspec.dtype         in ['bf16', 'e4m3_fp32']

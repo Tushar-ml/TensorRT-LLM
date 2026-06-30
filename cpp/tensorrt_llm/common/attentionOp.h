@@ -126,6 +126,12 @@ public:
         float const* sage_attn_sfs_v = nullptr;
         // Optional TRTLLM-Gen FMHA JIT warmup shape.
         bool trtllm_gen_jit_warmup = false;
+        // Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): the input is
+        // Q-only and the layer reads K/V already present in the (shared) cache slot.
+        // QKV preprocessing skips reading K/V from the input and skips the
+        // current-token K/V cache write; the attention kernel only reads the cache.
+        // Lives on the base so both context and generation phases inherit it.
+        bool skip_kv_cache_update = false;
     };
 
     template <typename T>

@@ -53,7 +53,10 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
 #endif
 
-#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+// bf16/fp16 KV cache support.  Originally non-spec-dec only; extended to the SWAP_AB spec-dec path
+// (SPEC_Q_SEQ_LEN set, e.g. Gemma4 head_dim=512 MTP) — there SWAP_AB=1 gives the same warp-spec tiling
+// without the headElems-scaled VTBuffer.  Non-swapAB spec-dec (SWAP_AB=0) stays excluded.
+#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -1858,17 +1861,22 @@ CUBIN_EXPORT __global__
                 ldgsts::barArrive(bar.produced, false);
                 if constexpr (isHeadPadded)
                 {
-                    static_assert(grainsPerPaddedInputHead <= warp_size);
-                    constexpr uint32_t headsPerIter = exactDiv(warp_size, grainsPerPaddedInputHead);
+                    // Dead for non-padded heads (e.g. head_dim=512, validElems==headElems), but the
+                    // non-dependent constexpr below is still evaluated by the compiler, and
+                    // grainsPerPaddedInputHead can exceed warp_size at headElems=512.  Guard the divisor
+                    // so the discarded branch stays well-formed (no semantic change when isHeadPadded).
+                    constexpr uint32_t padGrains = isHeadPadded ? grainsPerPaddedInputHead : 1u;
+                    static_assert(padGrains <= warp_size);
+                    constexpr uint32_t headsPerIter = exactDiv(warp_size, padGrains);
                     constexpr uint32_t nbIters = divUp(ctaNbValidQHeads, headsPerIter);
                     constexpr uint32_t nbWholeIters = ctaNbValidQHeads / headsPerIter;
 #pragma unroll
                     for (uint32_t i = 0; i < nbIters; i++)
                     {
                         uint32_t const idxHead = headsPerIter * i
-                            + BoundedVal<warp_size>{lane}.template divBy<grainsPerPaddedInputHead>().get();
+                            + BoundedVal<warp_size>{lane}.template divBy<padGrains>().get();
                         uint32_t const idxGrain
-                            = BoundedVal<warp_size>{lane}.template mod<grainsPerPaddedInputHead>().get();
+                            = BoundedVal<warp_size>{lane}.template mod<padGrains>().get();
                         if (i < nbWholeIters || idxHead < ctaNbValidQHeads)
                         {
                             constexpr uint32_t nbElemsPerGrain = exactDiv(grainBytes, sizeof(MultiBlockSMem::Elem));

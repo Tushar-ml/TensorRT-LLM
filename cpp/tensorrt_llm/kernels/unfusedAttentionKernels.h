@@ -208,6 +208,12 @@ struct QKVPreprocessingParams
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     bool generation_phase{false};
+    // When true, the input buffer holds Q only and the layer reads K/V that are
+    // already present in the (shared) KV-cache slot: skip reading K/V from the
+    // input buffer and skip the current-token K/V cache write. Only RoPE on Q and
+    // the q_output write are performed. Used by Gemma4 MTP draft layers that share
+    // (read-only) the backbone target layer's KV cache (cross-layer KV sharing).
+    bool skip_kv_cache_update{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -222,7 +228,9 @@ struct QKVPreprocessingParams
         half_rotary_dim = rotary_embedding_dim / 2;
         q_hidden_size = head_num * size_per_head;
         kv_hidden_size = kv_head_num * size_per_head;
-        hidden_size = q_hidden_size + 2 * kv_hidden_size;
+        // For read-only KV sharing the input is Q-only (no K/V appended), so the
+        // per-token stride must not include the K/V hidden size.
+        hidden_size = skip_kv_cache_update ? q_hidden_size : (q_hidden_size + 2 * kv_hidden_size);
     }
 
     std::string toString() const
@@ -307,6 +315,7 @@ struct QKVPreprocessingParams
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
+        ss << "skip_kv_cache_update: " << skip_kv_cache_update << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();

@@ -1,4 +1,5 @@
 import inspect
+import json
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
@@ -1407,6 +1408,41 @@ class DFlashForCausalLM(nn.Module):
 
 class MTPForCausalLM(nn.Module):
 
+    @staticmethod
+    def _load_gemma4_assistant_text_config(speculative_model):
+        """Load assistant ``text_config`` for Gemma4 MTP layer construction.
+
+        Prefer ``Gemma4AssistantConfig`` when transformers ships it; otherwise
+        parse ``config.json`` directly (older transformers builds).
+        """
+        if speculative_model is None:
+            return None, None
+        try:
+            from transformers import Gemma4AssistantConfig
+            asst_cfg = Gemma4AssistantConfig.from_pretrained(speculative_model)
+            if asst_cfg.text_config is not None:
+                return asst_cfg.text_config, asst_cfg.text_config.layer_types
+        except Exception:
+            pass
+
+        try:
+            import transformers
+            from transformers import Gemma4TextConfig
+
+            config_file = transformers.utils.hub.cached_file(
+                str(speculative_model), "config.json")
+            with open(config_file) as f:
+                raw = json.load(f)
+            text_dict = raw.get("text_config", raw)
+            text_config = Gemma4TextConfig(**text_dict)
+            layer_types = getattr(text_config, "layer_types", None)
+            return text_config, layer_types
+        except Exception as exc:
+            logger.warning(
+                f"Gemma4 MTP: failed to load assistant text_config from "
+                f"{speculative_model}: {exc}")
+            return None, None
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1437,13 +1473,33 @@ class MTPForCausalLM(nn.Module):
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
+            case "gemma4_text":
+                from .modeling_gemma4 import Gemma4MTP
+                mtp_layer = Gemma4MTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
-        checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
+
+        # Gemma4 uses a separate assistant model checkpoint; num_nextn_predict_layers
+        # is not defined in its config.  Use max_draft_len as the layer count and
+        # load the assistant config to determine internal decoder layer types.
+        mtp_kwargs: dict = {}
+        if model_type == "gemma4_text":
+            checkpoint_mtp_num_layers = model_config.spec_config.max_draft_len
+            _speculative_model = getattr(model_config.spec_config,
+                                         "speculative_model", None)
+            _asst_text_cfg, _assistant_layer_types = (
+                self._load_gemma4_assistant_text_config(_speculative_model))
+            if _assistant_layer_types is not None:
+                mtp_kwargs["mtp_layer_types"] = _assistant_layer_types
+            if _asst_text_cfg is not None:
+                mtp_kwargs["assistant_text_config"] = _asst_text_cfg
+        else:
+            checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
+
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
             mtp_repeat_count = model_config.spec_config.max_draft_len
@@ -1456,11 +1512,165 @@ class MTPForCausalLM(nn.Module):
 
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,
-                      model.aux_stream_dict)
+                      model.aux_stream_dict, **mtp_kwargs)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
+        self._model_type = model_type
+
+    def load_weights(self, weights: Dict, weight_mapper=None):
+        """Load MTP weights from a draft/assistant model checkpoint.
+
+        Currently only needed for Gemma4 whose assistant is a separate checkpoint.
+        For other models, MTP weights are embedded in the backbone checkpoint and
+        loaded as part of the backbone's ``load_weights``.
+
+        For Gemma4 with TP>1 we use each Linear module's own ``load_weights``
+        method so that tensor-parallel sharding is applied correctly (the
+        state_dict approach would store the full unsharded tensor into a
+        parameter that already has the TP-sharded shape, causing a size
+        mismatch at runtime).
+        """
+        if self._model_type != "gemma4_text":
+            return
+
+        from tensorrt_llm.logger import logger
+
+        def _copy_norm(norm_module, tensor):
+            """Copy a weight tensor into an RMSNorm (no TP sharding)."""
+            if tensor is None or not hasattr(norm_module, 'weight'):
+                return
+            norm_module.weight.data.copy_(
+                tensor.to(norm_module.weight.dtype))
+
+        def _copy_buf(module, attr, tensor):
+            """Copy a weight tensor into a buffer (e.g. layer_scalar)."""
+            if tensor is None:
+                return
+            buf = getattr(module, attr, None)
+            if buf is not None:
+                buf.data.copy_(tensor.to(buf.dtype))
+
+        def _load_linear(linear_module, tensor):
+            """TP-aware load into a Linear (or _QOnlyLinear) module."""
+            if tensor is None:
+                return
+            linear_module.load_weights([{"weight": tensor}])
+
+        loaded: set = set()
+
+        for k, mtp_outer in enumerate(self.mtp_layers):
+            # --- pre_projection (ROW-parallel Linear) ---
+            pre_proj_w = weights.get("pre_projection.weight")
+            if pre_proj_w is not None:
+                _load_linear(mtp_outer.pre_projection, pre_proj_w)
+                loaded.add("pre_projection.weight")
+
+            # --- self.norm (RMSNorm at assistant hidden size, no TP) ---
+            norm_w = weights.get("model.norm.weight")
+            if norm_w is not None:
+                _copy_norm(mtp_outer.norm, norm_w)
+                loaded.add("model.norm.weight")
+
+            # --- post_projection (COLUMN-parallel Linear: asst_H → backbone_H) ---
+            post_proj_w = weights.get("post_projection.weight")
+            if post_proj_w is not None and mtp_outer.post_projection is not None:
+                _load_linear(mtp_outer.post_projection, post_proj_w)
+                loaded.add("post_projection.weight")
+
+            # NOTE: model.embed_tokens.weight from the assistant checkpoint is the
+            # assistant model's standalone embedding table (vocab x asst_H).  In the
+            # MTP/one-engine integration we use the backbone's embed_tokens, so this
+            # weight is intentionally not loaded.
+
+            # --- MTP decoder sub-layers ---
+            for j, mtp_layer in enumerate(mtp_outer.mtp_layers):
+                hf_prefix = f"model.layers.{j}."
+
+                # Q-only projection (COLUMN-parallel)
+                q_proj_w = weights.get(hf_prefix + "self_attn.q_proj.weight")
+                if q_proj_w is not None:
+                    _load_linear(mtp_layer.self_attn.qkv_proj, q_proj_w)
+                    loaded.add(hf_prefix + "self_attn.q_proj.weight")
+
+                # q_norm (RMSNorm with learnable scale, no TP)
+                q_norm_w = weights.get(hf_prefix + "self_attn.q_norm.weight")
+                if q_norm_w is not None:
+                    _copy_norm(mtp_layer.self_attn.q_norm, q_norm_w)
+                    loaded.add(hf_prefix + "self_attn.q_norm.weight")
+
+                # o_proj (ROW-parallel Linear)
+                o_proj_w = weights.get(hf_prefix + "self_attn.o_proj.weight")
+                if o_proj_w is not None:
+                    _load_linear(mtp_layer.self_attn.o_proj, o_proj_w)
+                    loaded.add(hf_prefix + "self_attn.o_proj.weight")
+
+                # MLP projections.
+                # GatedMLP fuses gate+up into gate_up_proj; both HF weights
+                # are needed together for the fused load path.
+                gate_w = weights.get(hf_prefix + "mlp.gate_proj.weight")
+                up_w = weights.get(hf_prefix + "mlp.up_proj.weight")
+                if gate_w is not None and up_w is not None:
+                    mtp_layer.mlp.gate_up_proj.load_weights(
+                        [{"weight": gate_w}, {"weight": up_w}])
+                    loaded.add(hf_prefix + "mlp.gate_proj.weight")
+                    loaded.add(hf_prefix + "mlp.up_proj.weight")
+                down_w = weights.get(hf_prefix + "mlp.down_proj.weight")
+                if down_w is not None:
+                    _load_linear(mtp_layer.mlp.down_proj, down_w)
+                    loaded.add(hf_prefix + "mlp.down_proj.weight")
+
+                # RMSNorm layers (no TP)
+                for norm_name in (
+                    "input_layernorm",
+                    "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "post_feedforward_layernorm",
+                ):
+                    norm_w = weights.get(hf_prefix + f"{norm_name}.weight")
+                    if norm_w is not None:
+                        _copy_norm(getattr(mtp_layer, norm_name), norm_w)
+                        loaded.add(hf_prefix + f"{norm_name}.weight")
+
+                # layer_scalar buffer
+                ls_key = hf_prefix + "layer_scalar"
+                if ls_key in weights:
+                    _copy_buf(mtp_layer, "layer_scalar", weights[ls_key])
+                    loaded.add(ls_key)
+
+        num_sub = len(self.mtp_layers[0].mtp_layers) if self.mtp_layers else 0
+        expected_keys = {
+            "pre_projection.weight",
+            "model.norm.weight",
+            "post_projection.weight",
+        }
+        for j in range(num_sub):
+            hp = f"model.layers.{j}."
+            expected_keys.update({
+                hp + "self_attn.q_proj.weight",
+                hp + "self_attn.q_norm.weight",
+                hp + "self_attn.o_proj.weight",
+                hp + "mlp.gate_proj.weight",
+                hp + "mlp.up_proj.weight",
+                hp + "mlp.down_proj.weight",
+                hp + "input_layernorm.weight",
+                hp + "post_attention_layernorm.weight",
+                hp + "pre_feedforward_layernorm.weight",
+                hp + "post_feedforward_layernorm.weight",
+                hp + "layer_scalar",
+            })
+        missing = expected_keys - loaded
+        if missing:
+            logger.warning(
+                f"Gemma4 MTP: {len(missing)} expected keys not found in "
+                f"assistant checkpoint (e.g. {next(iter(missing))})."
+            )
+
+    def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
+        """Share lm_head and embed_tokens with the backbone model."""
+        self.lm_head = target_model.lm_head
+        self.embed_tokens = target_model.model.embed_tokens
 
 
 class MTPDraftModel(nn.Module):
@@ -1758,8 +1968,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # get logits
+            _hs_gathered = hidden_states[spec_metadata.gather_ids]
             logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
+                _hs_gathered,
                 self.lm_head,
                 attn_metadata,
                 True,

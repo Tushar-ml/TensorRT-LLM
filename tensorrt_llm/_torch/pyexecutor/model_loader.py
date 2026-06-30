@@ -307,10 +307,10 @@ class ModelLoader:
     @staticmethod
     def load_config_and_apply_defaults(
             checkpoint_dir: str, llm_args: TorchLlmArgs,
-            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+            checkpoint_loader: BaseCheckpointLoader) -> tuple[TorchLlmArgs, type | None]:
         """Load model config and apply model-specific defaults to llm_args."""
         if checkpoint_loader is None:
-            return llm_args
+            return llm_args, None
 
         config_kwargs = {
             'trust_remote_code': llm_args.trust_remote_code,
@@ -344,7 +344,7 @@ class ModelLoader:
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
 
-        return llm_args
+        return llm_args, model_cls
 
     @staticmethod
     def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,
@@ -534,6 +534,20 @@ class ModelLoader:
                     self._call_load_weights(model.load_draft_weights, weights,
                                             draft_weight_mapper)
 
+                # MTP Eagle one-model (e.g. Gemma4): assistant model weights
+                # live in a *separate* checkpoint but need_load_draft_weights()
+                # returns False because the draft is embedded in the backbone.
+                # MTPForCausalLM.load_weights() handles HF→TRT-LLM remapping
+                # internally, so no weight_mapper is required here.
+                if (self.spec_config is not None
+                        and self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                        and getattr(self.spec_config, 'speculative_model', None)
+                        and hasattr(model, 'load_draft_weights')):
+                    draft_weights = checkpoint_loader.load_weights(
+                        self.spec_config.speculative_model,
+                        mapping=self.mapping)
+                    model.load_draft_weights(draft_weights)
+
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
                 # node-shared GPU memory pool so multiple TRT-LLM instances
@@ -663,6 +677,18 @@ class ModelLoader:
                                 self._call_load_weights(
                                     model.load_draft_weights, draft_weights,
                                     draft_weight_mapper)
+
+                            # MTP Eagle one-model (e.g. Gemma4): load
+                            # assistant checkpoint inside GMS pool scope.
+                            if (self.spec_config is not None
+                                    and self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                                    and getattr(self.spec_config,
+                                                'speculative_model', None)
+                                    and hasattr(model, 'load_draft_weights')):
+                                _asst_weights = checkpoint_loader.load_weights(
+                                    self.spec_config.speculative_model,
+                                    mapping=self.mapping)
+                                model.load_draft_weights(_asst_weights)
 
                             # Run post_load hooks INSIDE the pool so any
                             # tensors they create or rebind (fused QKV,

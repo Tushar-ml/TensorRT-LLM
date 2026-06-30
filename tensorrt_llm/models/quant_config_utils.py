@@ -27,8 +27,21 @@ def update_quant_config_from_compressed_tensors(
     if config_groups is None:
         raise ValueError(f"config_groups is not set in {hf_quant_config}.")
 
-    weights_quant_config = config_groups["group_0"]["weights"]
-    inputs_quant_config = config_groups["group_0"]["input_activations"]
+    # The group name is arbitrary in compressed-tensors (commonly "group_0",
+    # but llm-compressor also emits descriptive names like "FP8_BLOCK").
+    # Accept "group_0" when present, otherwise the sole group; reject true
+    # multi-group (mixed-precision) configs which we don't support here.
+    if "group_0" in config_groups:
+        quant_group = config_groups["group_0"]
+    elif len(config_groups) == 1:
+        quant_group = next(iter(config_groups.values()))
+    else:
+        raise ValueError(
+            f"Expected a single quant group or 'group_0' in config_groups, "
+            f"got {list(config_groups)}.")
+
+    weights_quant_config = quant_group["weights"]
+    inputs_quant_config = quant_group["input_activations"]
     weights_quant_strategy = weights_quant_config["strategy"]
     inputs_quant_strategy = inputs_quant_config["strategy"]
 

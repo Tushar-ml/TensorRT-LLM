@@ -211,6 +211,10 @@ struct Multihead_attention_params_base
 
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
+
+    // Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): read K/V from the
+    // existing cache slot and do not load K/V from the input buffer or write new K/V.
+    bool skip_kv_cache_update = false;
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>
