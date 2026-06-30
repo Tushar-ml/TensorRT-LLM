@@ -393,6 +393,18 @@ public:
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
+        // For spec-dec, the JIT-compiled XQA kernel bakes the per-request spec-dec Q length
+        // (= max_draft_len + 1) in as a compile-time constant (SPEC_Q_SEQ_LEN for the hd512 QGMMA
+        // warp-spec variant), and the cubin cache key includes spec_decoding_max_generation_length.
+        // The value used here at configure time therefore must match the one used at enqueue time
+        // (derived from the spec-dec mask / position-offset shape), otherwise no cubin is found for
+        // the runtime key (cache miss -> hard check failure) or, worse, a kernel compiled for the
+        // wrong Q length is used. The configure-time EnqueueGenerationParams carries no spec-dec
+        // tensors, so source the length from the AttentionOp's static target gen length.
+        if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding && op.mSpecDecodingTargetMaxGenLen > 0)
+        {
+            enqueueParams.spec_decoding_max_generation_length = op.mSpecDecodingTargetMaxGenLen;
+        }
 
         op.prepareEnqueueGeneration<T, KVBlockArray>(enqueueParams);
 
