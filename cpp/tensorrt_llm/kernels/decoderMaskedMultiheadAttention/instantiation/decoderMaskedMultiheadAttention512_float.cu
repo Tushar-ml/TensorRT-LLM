@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,17 +14,26 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "../decoderMaskedMultiheadAttentionLaunch.h"
+#include "tensorrt_llm/common/config.h"
 
-#include "defines.h"
-#if SPEC_DEC
+TRTLLM_NAMESPACE_BEGIN
 
-struct SpecDecParams
+namespace kernels
 {
-    uint32_t qSeqLen;
-    uint32_t const* qCuSeqLens; // [nbReq + 1]
-    MaskType const* mask;       // [nbReq][qSeqLen][divUp(qSeqLen, 32)] or [qCuSeqLen[nbReq]][divUp(qSeqLen, 32)]
-    bool skipKVCacheUpdate = false;
-};
 
-#endif
+namespace
+{
+auto constexpr kSizePerHead = 512;
+} // namespace
+
+namespace mmha
+{
+
+INSTANTIATE_MMHA_LAUNCHERS(float, kSizePerHead)
+
+} // namespace mmha
+
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

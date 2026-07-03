@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -121,6 +121,11 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     case 64: MMHA_LAUNCH_KERNE_EX1(64);
     case 128: MMHA_LAUNCH_KERNE_EX2(128);
     case 256: MMHA_LAUNCH_KERNE_EX3(256);
+    // head_size 512 is required by Gemma4 global-attention layers; keep it out of FAST_BUILD skip list.
+    // Use the plain launcher (no attn_logit_softcapping): Gemma4 global layers do not use softcapping,
+    // and head_size 512 + softcapping is rejected above, so the qk_tanh_scale (softcapping) variant is
+    // intentionally not instantiated for 512.
+    case 512: MMHA_LAUNCH_KERNEL(512);
 #ifndef FAST_BUILD // skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
     case 48: MMHA_LAUNCH_KERNEL(48);
     case 80: MMHA_LAUNCH_KERNEL(80);
@@ -142,8 +147,8 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr std::array<int, 13> MMHA_SUPPORTED_HEAD_SIZES{
-    32, 48, 64, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256};
+static constexpr std::array<int, 14> MMHA_SUPPORTED_HEAD_SIZES{
+    32, 48, 64, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256, 512};
 
 bool mmha_supported(int head_size)
 {

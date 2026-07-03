@@ -186,11 +186,22 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                     new_key = _LANG_COMP + "model." + new_key[len(_LANG_COMP) :]
                 new_weights[new_key] = weights[key]
         else:
-            # Text-only: strip "model.language_model." -> "model."
+            # Text-only: strip "model.language_model." -> "model.".
+            # When loading a multimodal checkpoint into Gemma4ForCausalLM,
+            # drop vision/audio keys.
+            _MM_PREFIXES = (
+                "model.vision_tower.",
+                "model.embed_vision.",
+                "model.embed_audio.",
+                "model.audio_tower.",
+            )
             for key in list(weights.keys()):
-                new_key = key
-                if new_key.startswith(_LANG_PREFIX):
-                    new_key = "model." + new_key[len(_LANG_PREFIX) :]
+                if any(key.startswith(p) for p in _MM_PREFIXES):
+                    continue
+                if key.startswith(_LANG_PREFIX):
+                    new_key = "model." + key[len(_LANG_PREFIX) :]
+                else:
+                    new_key = key
                 new_weights[new_key] = weights[key]
 
         # Remap MoE keys: HF uses layers.N.experts/router, TRT-LLM uses layers.N.moe.experts/router
@@ -294,7 +305,18 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                     k_key = key_tmpl.format(layer_idx, "k")
                     v_key = key_tmpl.format(layer_idx, "v")
                     if k_key in weights and v_key not in weights:
-                        weights[v_key] = weights[k_key]
+                        # K=V layers omit v_proj entirely. Duplicate ALL k_proj
+                        # tensors into v_proj, not just ``.weight`` — quantized
+                        # checkpoints (e.g. FP8) also carry ``weight_scale`` /
+                        # ``weight_scale_inv`` / ``input_scale`` which must be
+                        # copied too, otherwise v_proj loads with an
+                        # uninitialized scale and produces garbage.
+                        k_prefix = k_key[:-len("weight")]  # ...k_proj.
+                        v_prefix = v_key[:-len("weight")]  # ...v_proj.
+                        for kk in [x for x in weights if x.startswith(k_prefix)]:
+                            vk = v_prefix + kk[len(k_prefix):]
+                            if vk not in weights:
+                                weights[vk] = weights[kk]
 
         # KV shared layers: HF omits k_proj/v_proj for shared layers.
         # The model uses Q-only projection for these layers, so no dummy

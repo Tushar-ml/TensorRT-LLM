@@ -929,7 +929,13 @@ class Attention(nn.Module):
                     q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
             ]
         else:
-            q, k, v = qkv, None, None
+            # Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): the
+            # qkv projection produces only Q (no K/V), so slice off the Q region.
+            if getattr(self.attn, "kv_shared_no_append", False):
+                q = qkv[..., :self.q_size]
+            else:
+                q = qkv
+            k, v = None, None
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
@@ -990,6 +996,18 @@ class Attention(nn.Module):
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
+
+        if getattr(self.attn, "kv_shared_no_append", False) and os.environ.get(
+                "GEMMA4_XQA_DBG") is not None:
+            import sys as _sys
+            print(
+                f"[GEMMA4_XQA_DBG_PY] layer={self.layer_idx} "
+                f"attn_output.shape={tuple(attn_output.shape)} "
+                f"o_proj.in={getattr(self.o_proj, 'in_features', '?')} "
+                f"o_proj.out={getattr(self.o_proj, 'out_features', '?')} "
+                f"contig={attn_output.is_contiguous()} dtype={attn_output.dtype}",
+                file=_sys.stderr,
+                flush=True)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

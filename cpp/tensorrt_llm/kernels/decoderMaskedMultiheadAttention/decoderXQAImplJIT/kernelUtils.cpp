@@ -85,8 +85,11 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 bool appliesRoPEInXqaKernel(XQAParams const& xqaParams, bool isQGMMAKernel)
 {
     // In-kernel RoPE is only implemented by the Hopper QGMMA kernel, and only for non-spec-dec, non-MLA
-    // cases.
-    if (!isQGMMAKernel || xqaParams.multi_query_tokens || xqaParams.isMLA())
+    // cases.  It is also kept off for head_size=512 (Gemma4 global): the bf16/fp16 hd512 warp-spec kernel
+    // is compiled only for the !USE_INPUT_KV configuration (IS_SUPPORTED_F16_CASE in mha_sm90.cu), and
+    // in-kernel RoPE sets USE_INPUT_KV=1, which would exclude that kernel and trip its "Hopper only"
+    // static_assert.  So apply RoPE externally (invokeQKVPreprocessing) for hd512.
+    if (!isQGMMAKernel || xqaParams.multi_query_tokens || xqaParams.isMLA() || xqaParams.head_size == 512)
     {
         return false;
     }
@@ -119,21 +122,47 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
-    if (!is_skip_softmax && xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    // Gemma4 global-attention layers use head_size=512 and route to the Hopper warp-spec kernel
+    // (mha_sm90.cu) through its SWAP_AB=1 tiling, which omits the headElems-scaled VTBuffer so
+    // head_size=512 fits SMEM with a bf16/fp16 KV cache.  Two configs reach SWAP_AB=1:
+    //   - spec-dec (MTP): multi_query_tokens=true, compiled with SPEC_Q_SEQ_LEN (set in nvrtcWrapper).
+    //     The SWAP_AB tile requires ctaNbValidQHeads = head_grp_size * q_seq_len <= 32.
+    //   - plain decode: multi_query_tokens=false, so SWAP_AB = !SPEC_DEC = 1 already (no VTBuffer) and
+    //     ctaNbValidQHeads = head_grp_size * beam_width (guarded <= 32 below).  HMMA caps at head_size
+    //     256, so QGMMA is the only fast XQA option for plain hd512 decode (otherwise it falls to MMHA).
+    bool const isHd512 = xqaParams.head_size == 512;
+    bool const isHd512SpecDec = xqaParams.multi_query_tokens && isHd512;
+    if (isHd512SpecDec)
     {
-        // Only use hopper kernel with fp16/bf16 kv cache data type when skip softmax is enabled
+        // ctaNbValidQHeads = head_grp_size * specDecQLen must be <= 32 (SWAP_AB tile).  specDecQLen is
+        // baked from spec_decoding_max_generation_length (see compileEngine), which is the real
+        // draft_len+1; generation_input_length is a placeholder at configure time.
+        int32_t const specQLen = xqaParams.spec_decoding_max_generation_length > 0
+            ? xqaParams.spec_decoding_max_generation_length
+            : xqaParams.generation_input_length;
+        if (head_grp_size * specQLen > 32)
+        {
+            return false;
+        }
+    }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (!is_skip_softmax && xqaParams.kv_cache_data_type != DATA_TYPE_E4M3 && !isHd512)
+    {
+        // Only use the hopper kernel with an fp16/bf16 KV cache when skip-softmax is enabled, or for the
+        // hd512 path (spec-dec or plain decode), which is validated for a bf16/fp16 KV cache and has no
+        // faster HMMA alternative (HMMA caps at head_size 256).  Plain hd<=256 stays on HMMA.
         return false;
     }
     if (xqaParams.beam_width != 1)
     {
         return false;
     }
-    if (xqaParams.head_size % 16 != 0 || xqaParams.head_size < 16 || xqaParams.head_size > 256)
+    uint32_t const maxHeadSize = isHd512 ? 512 : 256;
+    if (xqaParams.head_size % 16 != 0 || xqaParams.head_size < 16 || xqaParams.head_size > maxHeadSize)
     {
         return false;
     }
-    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
@@ -145,6 +174,16 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     return true;
 }
 
+// NOTE on head_size 512 (Gemma4 global attention):
+//  - QGMMA (Hopper warp-spec, mha_sm90.cu): supports head_size=512 via the SWAP_AB=1 variant, which
+//    omits the headElems-scaled VTBuffer so SMEM fits.  Both spec-dec (SPEC_Q_SEQ_LEN set in
+//    nvrtcWrapper) and plain decode (multi_query_tokens=false => SWAP_AB = !SPEC_DEC = 1) reach it; the
+//    isHd512 branch in supportConfigQGMMA above admits both (plain hd<=256 stays on HMMA).  Only the
+//    non-swapAB (generic spec-dec, SWAP_AB=0) hd512 path would overflow SMEM and is not enabled.
+//  - HMMA (Ampere-style, mha.cu): NOT templated for head_size>256 (gemm1WarpsPerGrp = headElems/warpTile.x
+//    breaks the warp-group tiling at 512), so its gate below stays at 256.  hd512 that misses QGMMA falls
+//    back to MMHA (decoderMaskedMultiheadAttention), which supports head_size=512.  tensorMapUtils.cpp is
+//    extended for 512.
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {
     if (!supportConfigCommon(xqaParams, forConfigurePlugin))

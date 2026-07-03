@@ -71,8 +71,10 @@ inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTIO
 
     // The number of partial rows to reduce in the final reduction.
     int rows_per_red = threads_per_block / threads_per_value;
-    // The amount of storage needed to finalize the outputs.
-    size_t red_sz = rows_per_red * params.hidden_size_per_head * sizeof(Tk) / 2;
+    // The amount of storage needed to finalize the outputs.  Size with the
+    // compile-time head size (Dh) so hd512 blocks get enough scratch space even
+    // if runtime params.hidden_size_per_head were ever mismatched.
+    size_t red_sz = rows_per_red * Dh * sizeof(Tk) / 2;
 
     size_t transpose_rotary_size = 0;
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
@@ -86,8 +88,8 @@ inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTIO
     size_t out_oi_sz = 0;
     if (params.multi_block_mode)
     {
-        // The size for partial output reduction computation.
-        out_oi_sz = params.max_seq_len_tile * params.hidden_size_per_head * sizeof(T);
+        // Size with compile-time Dh (see red_sz above).
+        out_oi_sz = params.max_seq_len_tile * Dh * sizeof(T);
     }
 
     // The max.
@@ -283,6 +285,15 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
 
     // Max block size is 1024.
     int dynamic_block_size = min(THDS_PER_BLOCK * block_size_factor, 1024);
+
+    // head_dim=512 (Gemma4 global-attention layers): the 512-/1024-thread block
+    // MMHA variants are not yet correct for Dh=512 (illegal memory access), so
+    // restrict to the validated 256-thread block path.  Perf follow-up: enable
+    // larger thread blocks for hd512 to improve long-context decode occupancy.
+    if (Dh >= 512)
+    {
+        dynamic_block_size = min(dynamic_block_size, 256);
+    }
 
     // Check if resources are enough for launch.
     int available_blocks = -1;

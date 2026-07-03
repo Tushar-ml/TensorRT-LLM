@@ -111,6 +111,7 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.position_shift_enabled = params.position_shift_enabled;
     preprocessingParms.cache_type = cache_type;
     preprocessingParms.separate_q_kv_output = true;
+    preprocessingParms.skip_kv_cache_update = params.skip_kv_cache_update;
     preprocessingParms.quantized_fp8_output = is_fp8_q_input;
     preprocessingParms.generation_phase = true;
     preprocessingParms.multi_processor_count = multiProcessorCount;

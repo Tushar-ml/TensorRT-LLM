@@ -53,7 +53,10 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
 #endif
 
-#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
+// bf16/fp16 KV cache support.  Originally non-spec-dec only; extended to the SWAP_AB spec-dec path
+// (SPEC_Q_SEQ_LEN set, e.g. Gemma4 head_dim=512 MTP) — there SWAP_AB=1 gives the same warp-spec tiling
+// without the headElems-scaled VTBuffer.  Non-swapAB spec-dec (SWAP_AB=0) stays excluded.
+#define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
 
 inline constexpr bool swapAB = SWAP_AB;
 
@@ -391,7 +394,7 @@ struct SpecDec
 
     __device__ inline uint32_t unmaskedSeqLen() const
     {
-        return seqLen - inputSeqLen;
+        return seqLen > inputSeqLen ? seqLen - inputSeqLen : 0U;
     }
 
     __device__ inline bool needMask(uint32_t idxTile, uint32_t idxQTokInCta) const
@@ -733,20 +736,29 @@ CUBIN_EXPORT __global__
     uint32_t const reqInputTokEnd = getInputTokOffset(specDecParams, idxReq + 1);
     uint32_t const nbInputSeqSplit = gridDim.x;
     assert(nbInputSeqSplit == divUp(specDecParams.qSeqLen, inputTokensPerCta));
+    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
+    uint32_t const origCacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+    // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): the draft owns no
+    // K/V for its own `inputSeqLen` (draft-token) positions; restrict the read to
+    // the backbone-written prefix [0, origCacheSeqLen - inputSeqLen) and disable
+    // the self-diagonal tree mask (see warpGrpApplyMask) so it never reads its own
+    // (possibly stale/unwritten) current positions.
+    uint32_t const cacheSeqLen = specDecParams.skipKVCacheUpdate
+        ? (origCacheSeqLen > inputSeqLen ? origCacheSeqLen - inputSeqLen : 0U)
+        : origCacheSeqLen;
 #else
     uint32_t const reqInputTokBeg = idxReq;
     uint32_t const reqInputTokEnd = idxReq + 1;
     constexpr uint32_t nbInputSeqSplit = 1;
     assert(gridDim.x == nbInputSeqSplit);
+    uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #endif
     uint32_t const idxHeadGrp = blockIdx.z % nbKHeads; // inside one request
     assert(gridDim.z == nbKHeads * batchSize);
-    uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
     static_assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
 #if SPEC_DEC
     uint32_t const idxInputSubSeq = blockIdx.x;
-    uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
     uint32_t const ctaTokOffset = inputTokensPerCta * idxInputSubSeq;
     uint32_t const ctaNbValidTokens = mha::min(uint32_t{inputTokensPerCta}, inputSeqLen - ctaTokOffset);
 
@@ -762,7 +774,7 @@ CUBIN_EXPORT __global__
 #endif
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
     // get the actual start position depending on ctaTokOffset, which is the draft token position per CTA
-    uint32_t const tok0SeqLen = cacheSeqLen - inputSeqLen + 1 + ctaTokOffset;
+    uint32_t const tok0SeqLen = origCacheSeqLen - inputSeqLen + 1 + ctaTokOffset;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
 #elif SLIDING_WINDOW
@@ -881,7 +893,7 @@ CUBIN_EXPORT __global__
     if (warpIdx.z == 0)
     {
 #if SPEC_DEC
-        SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, cacheSeqLen};
+        SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, origCacheSeqLen};
 #endif
 
 #if SKIP_SOFTMAX_ATTN_BLOCK_STATS
@@ -1858,17 +1870,22 @@ CUBIN_EXPORT __global__
                 ldgsts::barArrive(bar.produced, false);
                 if constexpr (isHeadPadded)
                 {
-                    static_assert(grainsPerPaddedInputHead <= warp_size);
-                    constexpr uint32_t headsPerIter = exactDiv(warp_size, grainsPerPaddedInputHead);
+                    // Dead for non-padded heads (e.g. head_dim=512, validElems==headElems), but the
+                    // non-dependent constexpr below is still evaluated by the compiler, and
+                    // grainsPerPaddedInputHead can exceed warp_size at headElems=512.  Guard the divisor
+                    // so the discarded branch stays well-formed (no semantic change when isHeadPadded).
+                    constexpr uint32_t padGrains = isHeadPadded ? grainsPerPaddedInputHead : 1u;
+                    static_assert(padGrains <= warp_size);
+                    constexpr uint32_t headsPerIter = exactDiv(warp_size, padGrains);
                     constexpr uint32_t nbIters = divUp(ctaNbValidQHeads, headsPerIter);
                     constexpr uint32_t nbWholeIters = ctaNbValidQHeads / headsPerIter;
 #pragma unroll
                     for (uint32_t i = 0; i < nbIters; i++)
                     {
                         uint32_t const idxHead = headsPerIter * i
-                            + BoundedVal<warp_size>{lane}.template divBy<grainsPerPaddedInputHead>().get();
+                            + BoundedVal<warp_size>{lane}.template divBy<padGrains>().get();
                         uint32_t const idxGrain
-                            = BoundedVal<warp_size>{lane}.template mod<grainsPerPaddedInputHead>().get();
+                            = BoundedVal<warp_size>{lane}.template mod<padGrains>().get();
                         if (i < nbWholeIters || idxHead < ctaNbValidQHeads)
                         {
                             constexpr uint32_t nbElemsPerGrain = exactDiv(grainBytes, sizeof(MultiBlockSMem::Elem));
@@ -2115,8 +2132,14 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
     static_assert(SPEC_Q_SEQ_LEN <= sizeof(MaskType) * 8, "not implemented");
 
-    assert(cacheSeqLen >= SPEC_Q_SEQ_LEN);
-    uint32_t const maskStartRow = cacheSeqLen - SPEC_Q_SEQ_LEN;
+    // Q-only cross-layer KV sharing (Gemma4 MTP draft): no per-draft-token
+    // diagonal -- every draft query attends the whole backbone region
+    // [0, cacheSeqLen) (already clamped to exclude the draft's own positions).
+    // maskStartRow == cacheSeqLen makes the diagonal branch below unreachable
+    // (the globalRow >= cacheSeqLen guard subsumes it) and avoids underflow.
+    bool const skipSelfKV = specDec.params.skipKVCacheUpdate;
+    uint32_t const maskStartRow
+        = (!skipSelfKV && cacheSeqLen >= SPEC_Q_SEQ_LEN) ? cacheSeqLen - SPEC_Q_SEQ_LEN : cacheSeqLen;
     uint32_t const tileStartRow = tileSize * idxTile;
     if (tileStartRow + tileSize < maskStartRow)
     {

@@ -79,6 +79,7 @@ struct XQAKernelRuntimeHashKey
     PositionEmbeddingType position_embedding_type;
     // Number of head elements RoPE is applied to. A value of 0 means rotary dim is not part of this key.
     int rotary_embedding_dim;
+    unsigned int spec_decoding_max_generation_length;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -87,7 +88,8 @@ struct XQAKernelRuntimeHashKey
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
             && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type
-            && rotary_embedding_dim == other.rotary_embedding_dim;
+            && rotary_embedding_dim == other.rotary_embedding_dim
+            && spec_decoding_max_generation_length == other.spec_decoding_max_generation_length;
     }
 };
 
@@ -127,7 +129,8 @@ inline XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& x
     return {xqaParams.kv_cache_data_type, headSize, beamWidth, kernelNumQHeadsOverKV, kernelMTilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
         xqaParams.multi_query_tokens, xqaParams.is_fp8_output, xqaParams.position_embedding_type,
-        includesRotaryDim ? xqaParams.rotary_embedding_dim : 0};
+        includesRotaryDim ? xqaParams.rotary_embedding_dim : 0,
+        xqaParams.multi_query_tokens ? static_cast<unsigned int>(xqaParams.spec_decoding_max_generation_length) : 0};
 }
 
 struct XQAKernelRuntimeHasher
@@ -155,6 +158,8 @@ struct XQAKernelRuntimeHasher
         key ^= static_cast<int8_t>(s.position_embedding_type);
         key <<= 9;                   // 62; rotary dims are <= 256, 0 means not used.
         key ^= static_cast<size_t>(s.rotary_embedding_dim);
+        key <<= 4;
+        key ^= s.spec_decoding_max_generation_length;
         return key;
     }
 };
@@ -295,7 +300,14 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     launchParams = {};
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.slidingWindowSize = params.cyclic_attention_window_size;
-    launchParams.qScale = params.q_scaling;
+    // The XQA kernel computes qkScale = qScale * rsqrt(head_dim), i.e. it treats
+    // qScale as a multiplier on 1/sqrt(head_dim).  The TRT-LLM convention (MMHA/FMHA)
+    // is softmax_scale = 1 / (sqrt(head_dim) * q_scaling), i.e. q_scaling is a
+    // divisor.  Passing q_scaling directly is only correct when q_scaling == 1;
+    // for models that set q_scaling != 1 (e.g. Gemma4, which uses
+    // q_scaling = 1/sqrt(head_dim)) it makes the softmax scale q_scaling^2 too small.
+    // Pass 1/q_scaling so qkScale == 1/(sqrt(head_dim) * q_scaling), matching MMHA.
+    launchParams.qScale = (params.q_scaling != 0.f) ? (1.0f / params.q_scaling) : 1.0f;
     launchParams.output = static_cast<uint8_t*>(params.output);
     launchParams.rcpOutScale = params.fp8_out_scale;
     launchParams.qkv = static_cast<uint8_t const*>(params.qkv);

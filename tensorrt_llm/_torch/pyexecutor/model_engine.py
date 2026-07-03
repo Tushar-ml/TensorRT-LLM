@@ -2131,7 +2131,8 @@ class PyTorchModelEngine(ModelEngine):
                         previous_pos_id_offsets_cuda[:previous_batch_tokens])
 
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
-                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
+                if isinstance(inputs['attn_metadata'],
+                              TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -

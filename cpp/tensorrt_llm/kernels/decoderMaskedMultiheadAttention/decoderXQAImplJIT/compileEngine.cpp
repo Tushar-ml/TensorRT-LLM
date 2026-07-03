@@ -84,6 +84,18 @@ CubinObj CompileEngine::compile() const
     {
         TLLM_CHECK(ropeStyle == tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
     }
+    // The hd512 Gemma4 spec-dec kernel uses the SWAP_AB warp-spec variant, which bakes
+    // specDecQLen (= the SPEC_Q_SEQ_LEN macro) in as a compile-time constant.  It must therefore be
+    // the real per-request spec-dec Q length (draft_len + 1), carried by
+    // spec_decoding_max_generation_length.  generation_input_length is a placeholder (0 at configure
+    // time, or the HMMA tileSize WAR value of 16) and would yield ctaNbValidQHeads = head_grp_size *
+    // specDecQLen = 0 (or > 32), so use the spec-dec max length here instead.
+    uint32_t jitQSeqLen = static_cast<uint32_t>(mXqaParams.generation_input_length);
+    if (useQGMMAKernel && mXqaParams.multi_query_tokens && mXqaParams.head_size == 512
+        && mXqaParams.spec_decoding_max_generation_length > 0)
+    {
+        jitQSeqLen = static_cast<uint32_t>(mXqaParams.spec_decoding_max_generation_length);
+    }
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
         /*num_q_heads=*/static_cast<uint32_t>(mXqaParams.num_q_heads),
@@ -91,7 +103,7 @@ CubinObj CompileEngine::compile() const
         /*beam_width=*/static_cast<uint32_t>(mXqaParams.beam_width),
         /*tokens_per_block=*/static_cast<uint32_t>(mXqaParams.tokens_per_block),
         /*multi_query_tokens=*/mXqaParams.multi_query_tokens,
-        /*q_seq_len=*/static_cast<uint32_t>(mXqaParams.generation_input_length),
+        /*q_seq_len=*/jitQSeqLen,
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),

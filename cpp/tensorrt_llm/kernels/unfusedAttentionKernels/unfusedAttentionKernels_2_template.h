@@ -47,7 +47,7 @@ namespace kernels
 // One warp of threads handle one head in terms of rotary embedding.
 // Balance the work across threads in one warp for different head size.
 // The minimum head size should be 32.
-// Assume head size <= 256.
+// Assume head size <= 512.
 template <typename T, int Dh_MAX>
 struct Rotary_vec_t
 {
@@ -96,6 +96,15 @@ struct Rotary_vec_t<float, 256>
     static constexpr int size = 8;
 };
 
+template <>
+struct Rotary_vec_t<float, 512>
+{
+    using Type = mmha::Float8_;
+    using BaseType = float;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
@@ -127,6 +136,15 @@ struct Rotary_vec_t<half, 128>
 
 template <>
 struct Rotary_vec_t<half, 256>
+{
+    using Type = uint4;
+    using BaseType = uint16_t;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
+template <>
+struct Rotary_vec_t<half, 512>
 {
     using Type = uint4;
     using BaseType = uint16_t;
@@ -167,6 +185,15 @@ struct Rotary_vec_t<__nv_bfloat16, 128>
 
 template <>
 struct Rotary_vec_t<__nv_bfloat16, 256>
+{
+    using Type = mmha::bf16_8_t;
+    using BaseType = __nv_bfloat16;
+    using QuantizedType = mmha::fp8_8_t;
+    static constexpr int size = 8;
+};
+
+template <>
+struct Rotary_vec_t<__nv_bfloat16, 512>
 {
     using Type = mmha::bf16_8_t;
     using BaseType = __nv_bfloat16;
@@ -458,18 +485,23 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             auto const src_k_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_k_offset + hidden_idx_kv;
             auto const src_v_idx = static_cast<size_t>(global_token_idx) * hidden_size + src_v_offset + hidden_idx_kv;
 
-            VecType q, k, v, q_pair, k_pair;
+            VecType q{}, k{}, v{}, q_pair{}, k_pair{};
             // key without position embedding
-            VecType k_wo_pos;
+            VecType k_wo_pos{};
 
             // load q,k,v and add bias
             if (valid_head_dim_idx)
             {
                 q = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx]);
-                k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
-                v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
                 q_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-                k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                // Read-only KV sharing: the input is Q-only, so skip reading K/V
+                // from the input buffer (avoids over-reading past the Q region).
+                if (!params.skip_kv_cache_update)
+                {
+                    k = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx]);
+                    v = *reinterpret_cast<VecType const*>(&params.qkv_input[src_v_idx]);
+                    k_pair = *reinterpret_cast<VecType const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+                }
 
                 if constexpr (ADD_BIAS)
                 {
@@ -550,7 +582,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
             bool const useKVCache = params.kv_cache_buffer.data != nullptr;
             auto token_idx_in_kv_cache = token_idx_in_seq;
-            bool valid_kv_cache_pos = useKVCache;
+            // Read-only KV sharing: never write the current token's K/V.
+            bool valid_kv_cache_pos = useKVCache && !params.skip_kv_cache_update;
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -874,12 +907,20 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
-        auto k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
-        auto v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+        // For read-only KV sharing the input buffer is Q-only: K/V are already in
+        // the (shared) cache slot, so we must not read them from the input (it would
+        // over-read past the Q region) nor recompute/store them below.
+        VecT k{};
+        VecT v{};
         [[maybe_unused]] auto q_pair
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
-        [[maybe_unused]] auto k_pair
-            = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        [[maybe_unused]] VecT k_pair{};
+        if (!params.skip_kv_cache_update)
+        {
+            k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
+            v = *reinterpret_cast<VecT const*>(&params.qkv_input[src_v_idx]);
+            k_pair = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+        }
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.
         if constexpr (ADD_BIAS)
@@ -966,7 +1007,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         auto const channelIdx = head_dim_vec_idx;
         bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
-        bool valid_kv_cache_pos = useKVCache;
+        // Read-only KV sharing: never write the current token's K/V (the shared
+        // cache slot already holds the K/V written by the backbone/target layer).
+        bool valid_kv_cache_pos = useKVCache && !params.skip_kv_cache_update;
 
         auto kDst = useKVCache
             ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))
@@ -1262,6 +1305,10 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     else if (params.size_per_head <= 256)
     {
         kernelDispatchHeadSize<256, T, TCache, KVCacheBuffer>(params, stream);
+    }
+    else if (params.size_per_head <= 512)
+    {
+        kernelDispatchHeadSize<512, T, TCache, KVCacheBuffer>(params, stream);
     }
     else
     {
@@ -1644,6 +1691,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 192: kernelV2DispatchHeadSize<192, 192, T, TCache, KVCacheBuffer>(params, stream); break;
     case 224: kernelV2DispatchHeadSize<224, 224, T, TCache, KVCacheBuffer>(params, stream); break;
     case 256: kernelV2DispatchHeadSize<256, 256, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 512: kernelV2DispatchHeadSize<512, 512, T, TCache, KVCacheBuffer>(params, stream); break;
     case 576: kernelV2DispatchHeadSize<576, 576, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
         // Fall back to v1 kernel.

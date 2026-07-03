@@ -129,6 +129,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    bool skip_kv_cache_update = false;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -210,6 +211,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
     xqaParams.layer_idx = generationsParams.layer_idx;
+    // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): preprocessing skips
+    // the K/V input read + cache write; the kernel reads the existing (shared) cache.
+    xqaParams.skip_kv_cache_update = generationsParams.skip_kv_cache_update;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -319,6 +323,32 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
 #endif
     // Cross attention parameters.
     xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
+
+    if (xqaParams.skip_kv_cache_update && std::getenv("GEMMA4_XQA_DBG") != nullptr)
+    {
+        int seqlens_host[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        int const nseq = std::min(8, std::max(1, generationsParams.num_requests));
+        if (xqaParams.sequence_lengths != nullptr)
+        {
+            cudaMemcpy(seqlens_host, xqaParams.sequence_lengths, nseq * sizeof(int), cudaMemcpyDeviceToHost);
+        }
+        int past0 = -1, past1 = -1;
+        if (generationsParams.host_past_key_value_lengths != nullptr)
+        {
+            past0 = generationsParams.host_past_key_value_lengths[0];
+            past1 = nseq > 1 ? generationsParams.host_past_key_value_lengths[1] : -1;
+        }
+        TLLM_LOG_INFO(
+            "[GEMMA4_XQA_DBG] read-only-KV layer_idx=%d num_q=%d num_kv=%d head_size=%d "
+            "multi_query_tokens=%d spec_max_gen_len=%d gen_input_len=%d max_past_kv=%d "
+            "total_input_tokens=%d num_tokens=%d cyclic_win=%d nseq=%d seqlens=[%d,%d,%d,%d] "
+            "host_past_kv=[%d,%d] max_attn_win=%d",
+            xqaParams.layer_idx, xqaParams.num_q_heads, xqaParams.num_kv_heads, xqaParams.head_size,
+            (int) xqaParams.multi_query_tokens, xqaParams.spec_decoding_max_generation_length,
+            xqaParams.generation_input_length, xqaParams.max_past_kv_length, xqaParams.total_num_input_tokens,
+            generationsParams.num_tokens, xqaParams.cyclic_attention_window_size, nseq, seqlens_host[0],
+            seqlens_host[1], seqlens_host[2], seqlens_host[3], past0, past1, generationsParams.max_attention_window_size);
+    }
 
     return true;
 }
@@ -593,8 +623,20 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
     // Set the input buffers.
     params.q = reinterpret_cast<DataType const*>(input_params.qkv_buf);
-    params.k = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units;
-    params.v = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
+    params.skip_kv_cache_update = input_params.skip_kv_cache_update;
+    if (input_params.skip_kv_cache_update)
+    {
+        // Q-only input: do not index past the Q region.
+        params.stride = hidden_units;
+        params.k = nullptr;
+        params.v = nullptr;
+    }
+    else
+    {
+        params.k = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units;
+        params.v = reinterpret_cast<DataType const*>(input_params.qkv_buf) + hidden_units + hidden_units_kv;
+        params.stride = hidden_units + 2 * hidden_units_kv;
+    }
 
     params.int8_kv_cache = input_params.kv_cache_quant_mode.hasInt8KvCache();
     params.fp8_kv_cache = input_params.kv_cache_quant_mode.hasFp8KvCache();
@@ -604,7 +646,6 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.kv_scale_quant_orig = input_params.kv_scale_quant_orig;
     }
 
-    params.stride = hidden_units + 2 * hidden_units_kv;
     params.finished = const_cast<bool*>(input_params.finished);
 
     params.cache_indir = input_params.cache_indir;
@@ -1783,6 +1824,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA || isCrossAttention();
         preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
         preprocessingParams.generation_phase = false;
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): skip reading K/V
+        // from the Q-only input and skip the K/V cache write in the context path too
+        // (the shared cache slot already holds the backbone-written K/V).
+        preprocessingParams.skip_kv_cache_update = params.skip_kv_cache_update;
         preprocessingParams.multi_processor_count = mMultiProcessorCount;
 
         preprocessingParams.rotary_vision_start = mVisionStart;
@@ -2057,6 +2102,22 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
         TLLM_CHECK_WITH_INFO(mAttentionChunkSize == std::nullopt, "Unfused MHA does not support chunked attention");
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): this unfused-MHA
+        // context fallback (used for head_size==512, which has no context FMHA
+        // kernel) sources K/V from the fused QKV input. With skip_kv_cache_update
+        // the input is Q-only, so invokeAddFusedQKVBiasTranspose below would read
+        // K/V past the end of the Q-only buffer -> illegal memory access. This
+        // branch is only ever reached by warmup dummy-prefill forwards: the MTP
+        // draft performs generation-style attention (XQA path) on real requests
+        // and never a real context/prefill, so this output is discarded. Zero the
+        // context output and skip the unfused compute to avoid the OOB read.
+        if (useKVCache() && params.skip_kv_cache_update)
+        {
+            check_cuda_error(cudaMemsetAsync(params.context_buf, 0,
+                static_cast<size_t>(params.num_tokens) * local_hidden_units_qo * sizeof(T), stream));
+            sync_check_cuda_error(stream);
+            return 0;
+        }
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(workspaceViews.kBuf, 0, k_buf_2_size + v_buf_2_size, stream).
@@ -2102,7 +2163,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // write KV to cache
-        if (useKVCache())
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): the input is
+        // Q-only and the shared cache slot already holds the backbone-written K/V,
+        // so skip the cache write here.  Unlike the context-FMHA path (which gates
+        // the write inside invokeQKVPreprocessing via skip_kv_cache_update), this
+        // unfused-MHA fallback (used for head_size==512 with no context FMHA)
+        // otherwise writes garbage K/V (read past the Q-only buffer) into the
+        // shared slot and corrupts the backbone's K/V.
+        if (useKVCache() && !params.skip_kv_cache_update)
         {
             invokeTranspose4dBatchMajor(workspaceViews.kBuf, workspaceViews.vBuf, kv_cache_buffer, params.batch_size,
                 isCrossAttention() ? params.cross_kv_length : params.input_seq_length,
@@ -2455,7 +2523,51 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         XQAParams xqaParams{};
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
 
-        if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+        // CUDA-graph correctness for sliding-window (SWA) layers.
+        //
+        // The multi-CTA ("multi-block") XQA decode/spec-dec kernels size their KV-split
+        // CTA count from the runtime history length:
+        //   multiBlockCount = historyLength / kMinHistoryTokensPerBlock   (decoderXQARunner)
+        //   grid            = numKVHeads * batch * multiBlockCount
+        // Under CUDA graph this grid is computed at *capture* time from the warmup KV
+        // (~max_seq) and frozen. At replay with a smaller real KV the extra KV-split CTAs
+        // are phantom; for the cyclic (sliding-window) KV cache their partials feed the
+        // multi-CTA semaphore reduction and corrupt the result (decode garbage). This
+        // bites layers whose attention window < the model max seq (real SWA), e.g.
+        // Gemma4's hd256 layers once max_seq_len >= sliding_window.
+        //
+        // SWA fix: keep the fast XQA kernel but force *single-CTA* XQA (multi_block_mode =
+        // false) for SWA layers. The grid then becomes numKVHeads * batch with no KV-
+        // length dependence, so it is CUDA-graph-safe; eager decode keeps multi-block XQA.
+        // We can't scope this to "graph capture only" -- cudaStreamIsCapturing is not
+        // observable for TRT-LLM's PyTorch CG capture here -- so single-CTA XQA also
+        // applies to eager SWA decode (still far faster than the MMHA fallback).
+        // GEMMA4_NO_XQA_SWA=1 forces the MMHA path entirely as an escape hatch.
+        //
+        // hd512 globals: the plain-hd512 QGMMA (Hopper warp-spec) decode kernel is correct
+        // in eager mode but produces garbage under CUDA graph. This is NOT the multi-block
+        // grid issue above -- forcing single-CTA (multi_block_mode = false) does not fix it
+        // (empirically still garbage), so the corruption is elsewhere in the warp-spec /
+        // external-RoPE hd512 path captured at graph-capture time. CUDA graph is on by
+        // default, so route *plain* (non-spec-dec) hd512 global decode to the (correct)
+        // MMHA decode path by default. Opt back into the faster QGMMA kernel with
+        // GEMMA4_USE_XQA_HD512=1 when running without CUDA graph.
+        //
+        // Spec-dec (multi_query_tokens, e.g. Gemma4 MTP) hd512 layers are excluded from
+        // this fallback: the spec path has no MMHA kernel (it would hit the "No available
+        // XQA kernels for speculative decoding" check below) and uses the separate spec-dec
+        // QGMMA SWAP_AB kernel, so they must keep XQA.
+        bool const is_swa_layer = (mMaxSeqLen > 0) && (params.max_attention_window_size < mMaxSeqLen);
+        bool const is_hd512_layer = (xqaParams.head_size == 512);
+        static bool const s_no_xqa_swa = std::getenv("GEMMA4_NO_XQA_SWA") != nullptr;
+        static bool const s_use_xqa_hd512 = std::getenv("GEMMA4_USE_XQA_HD512") != nullptr;
+        if (is_swa_layer)
+        {
+            xqaParams.multi_block_mode = false;
+        }
+        bool const avoid_xqa = (is_swa_layer && s_no_xqa_swa)
+            || (is_hd512_layer && !s_use_xqa_hd512 && !xqaParams.multi_query_tokens);
+        if (mEnableXQA && !avoid_xqa && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             xqaParams.stream = stream;
@@ -2466,6 +2578,12 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             }
             {
                 mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
+            }
+            if (xqaParams.skip_kv_cache_update && std::getenv("GEMMA4_XQA_DBG") != nullptr)
+            {
+                cudaError_t const dbgErr = cudaStreamSynchronize(stream);
+                TLLM_LOG_INFO("[GEMMA4_XQA_DBG] post-XQA sync layer_idx=%d head_size=%d -> %s", xqaParams.layer_idx,
+                    xqaParams.head_size, cudaGetErrorString(dbgErr));
             }
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
             {
@@ -2622,6 +2740,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
+    dispatch_params.skip_kv_cache_update = params.skip_kv_cache_update;
 
     using DataType = typename SATypeConverter<T>::Type;
     {

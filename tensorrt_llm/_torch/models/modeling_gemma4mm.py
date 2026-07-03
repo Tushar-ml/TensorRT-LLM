@@ -586,11 +586,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     """
 
     @classmethod
+    def flashinfer_supports_one_engine_spec_decode(cls) -> bool:
+        from .modeling_gemma4 import Gemma4ForCausalLM
+        return Gemma4ForCausalLM.flashinfer_supports_one_engine_spec_decode()
+
+    uses_shared_backbone_kv_for_mtp = True
+
+    @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        from .modeling_gemma4 import Gemma4ForCausalLM
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
@@ -716,7 +722,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        # The text decoder must use the SAME attention backend the engine builds
+        # metadata for (engine default is TRTLLM); forcing FLASHINFER here makes
+        # the text attention read a TrtllmAttentionMetadata that lacks
+        # FlashInfer-only fields (e.g. ``kv_layout``) and crashes. The TRTLLM
+        # backend is the validated Gemma4 hd512 path. Vision/audio towers keep
+        # TRTLLM.
+        preferred_backend = (model_config.attn_backend
+                             if name == "text_config" else "TRTLLM")
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
@@ -760,6 +773,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if self.embed_audio is not None:
             embed_a_weights = filter_weights("embed_audio", stripped)
             self.embed_audio.load_weights(embed_a_weights)
+
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
+        self.llm.load_draft_weights(weights, weight_mapper)
 
     def post_config(self):
         self.config = self.llm.config
@@ -1041,6 +1057,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             mm_token_type_ids=mm_token_type_ids,
             ple_input_ids=ple_input_ids,
             lora_params=kwargs.get("lora_params", None),
+            # Forward speculative-decoding context so the inner LLM's spec
+            # worker (MTP) can gather logits / run the draft. Without these the
+            # spec path hits ``spec_metadata.gather_ids`` on None.
+            spec_metadata=kwargs.get("spec_metadata", None),
+            resource_manager=kwargs.get("resource_manager", None),
         )
         return logits
 
