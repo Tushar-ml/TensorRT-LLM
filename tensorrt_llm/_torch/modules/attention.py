@@ -929,7 +929,13 @@ class Attention(nn.Module):
                     q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
             ]
         else:
-            q, k, v = qkv, None, None
+            # Q-only cross-layer KV sharing (e.g. Gemma4 MTP draft layers): the
+            # qkv projection produces only Q (no K/V), so slice off the Q region.
+            if getattr(self.attn, "kv_shared_no_append", False):
+                q = qkv[..., :self.q_size]
+            else:
+                q = qkv
+            k, v = None, None
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).

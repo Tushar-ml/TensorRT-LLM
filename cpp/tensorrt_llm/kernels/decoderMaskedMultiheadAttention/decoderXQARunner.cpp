@@ -228,6 +228,7 @@ struct SpecDecParams
     uint32_t const* qCuSeqLens; // [nbReq + 1]
     using MaskType = uint32_t;
     MaskType const* mask;       // [nbReq][qSeqLen][divUp(qSeqLen, 32)] or [qCuSeqLen[nbReq]][divUp(qSeqLen, 32)]
+    bool skipKVCacheUpdate = false;
 };
 } // namespace
 
@@ -380,7 +381,8 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             : qSeqLen;
         return {.qSeqLen = maxQSeqLen,
             .qCuSeqLens = reinterpret_cast<uint32_t const*>(launchParams.cu_seq_lens),
-            .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
+            .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask),
+            .skipKVCacheUpdate = xqaParams.skip_kv_cache_update};
     };
 
     constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 19;
