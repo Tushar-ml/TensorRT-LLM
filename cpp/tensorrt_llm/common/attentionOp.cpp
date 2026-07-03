@@ -2102,6 +2102,22 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
         TLLM_CHECK_WITH_INFO(mAttentionChunkSize == std::nullopt, "Unfused MHA does not support chunked attention");
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): this unfused-MHA
+        // context fallback (used for head_size==512, which has no context FMHA
+        // kernel) sources K/V from the fused QKV input. With skip_kv_cache_update
+        // the input is Q-only, so invokeAddFusedQKVBiasTranspose below would read
+        // K/V past the end of the Q-only buffer -> illegal memory access. This
+        // branch is only ever reached by warmup dummy-prefill forwards: the MTP
+        // draft performs generation-style attention (XQA path) on real requests
+        // and never a real context/prefill, so this output is discarded. Zero the
+        // context output and skip the unfused compute to avoid the OOB read.
+        if (useKVCache() && params.skip_kv_cache_update)
+        {
+            check_cuda_error(cudaMemsetAsync(params.context_buf, 0,
+                static_cast<size_t>(params.num_tokens) * local_hidden_units_qo * sizeof(T), stream));
+            sync_check_cuda_error(stream);
+            return 0;
+        }
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(workspaceViews.kBuf, 0, k_buf_2_size + v_buf_2_size, stream).
