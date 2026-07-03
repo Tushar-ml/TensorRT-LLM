@@ -300,7 +300,14 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     launchParams = {};
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.slidingWindowSize = params.cyclic_attention_window_size;
-    launchParams.qScale = params.q_scaling;
+    // The XQA kernel computes qkScale = qScale * rsqrt(head_dim), i.e. it treats
+    // qScale as a multiplier on 1/sqrt(head_dim).  The TRT-LLM convention (MMHA/FMHA)
+    // is softmax_scale = 1 / (sqrt(head_dim) * q_scaling), i.e. q_scaling is a
+    // divisor.  Passing q_scaling directly is only correct when q_scaling == 1;
+    // for models that set q_scaling != 1 (e.g. Gemma4, which uses
+    // q_scaling = 1/sqrt(head_dim)) it makes the softmax scale q_scaling^2 too small.
+    // Pass 1/q_scaling so qkScale == 1/(sqrt(head_dim) * q_scaling), matching MMHA.
+    launchParams.qScale = (params.q_scaling != 0.f) ? (1.0f / params.q_scaling) : 1.0f;
     launchParams.output = static_cast<uint8_t*>(params.output);
     launchParams.rcpOutScale = params.fp8_out_scale;
     launchParams.qkv = static_cast<uint8_t const*>(params.qkv);
