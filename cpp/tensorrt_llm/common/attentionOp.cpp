@@ -2147,7 +2147,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // write KV to cache
-        if (useKVCache())
+        // Q-only cross-layer KV sharing (Gemma4 MTP draft layers): the input is
+        // Q-only and the shared cache slot already holds the backbone-written K/V,
+        // so skip the cache write here.  Unlike the context-FMHA path (which gates
+        // the write inside invokeQKVPreprocessing via skip_kv_cache_update), this
+        // unfused-MHA fallback (used for head_size==512 with no context FMHA)
+        // otherwise writes garbage K/V (read past the Q-only buffer) into the
+        // shared slot and corrupts the backbone's K/V.
+        if (useKVCache() && !params.skip_kv_cache_update)
         {
             invokeTranspose4dBatchMajor(workspaceViews.kBuf, workspaceViews.vBuf, kv_cache_buffer, params.batch_size,
                 isCrossAttention() ? params.cross_kv_length : params.input_seq_length,
