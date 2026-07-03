@@ -774,6 +774,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             embed_a_weights = filter_weights("embed_audio", stripped)
             self.embed_audio.load_weights(embed_a_weights)
 
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
+        self.llm.load_draft_weights(weights, weight_mapper)
+
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config

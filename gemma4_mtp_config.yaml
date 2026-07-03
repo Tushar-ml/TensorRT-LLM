@@ -26,7 +26,7 @@ speculative_config:
   # Path or HF ID of the Gemma4 assistant (draft) model.
   # The assistant checkpoint is a separate model with architecture
   # "gemma4_assistant" / Gemma4AssistantForCausalLM.
-  speculative_model: google/gemma-4-27b-it-assistant
+  speculative_model: google/gemma-4-31b-it-assistant
 
   # Number of draft tokens to predict per step.
   # Gemma4 assistant typically yields best throughput at max_draft_len=1.
@@ -43,7 +43,7 @@ speculative_config:
 # FlashInfer is required for Gemma4 (hybrid VSWA + per-layer head_dim 256/512).
 # Requires FlashInfer >= 0.6.13 with fa2 hd512 kernels (PR #3576+#3652).
 # Keep cuda_graph_config: null until decode graphs are validated on Hopper.
-attn_backend: FLASHINFER
+attn_backend: TRTLLM
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
 # Adjust to your GPU count. Gemma4-27B fits in 4 × A100-80G with TP=4.
@@ -51,9 +51,10 @@ attn_backend: FLASHINFER
 
 # ── KV cache ─────────────────────────────────────────────────────────────────
 # Optional: cap pool to avoid OOM during first load.
-# kv_cache_config:
-#   free_gpu_memory_fraction: 0.85
+kv_cache_config:
+  free_gpu_memory_fraction: 0.85
 
 # ── Sequence length ───────────────────────────────────────────────────────────
-max_seq_len: 8192
-max_num_tokens: 8192
+max_seq_len: 2048
+max_num_tokens: 2048
+max_batch_size: 1

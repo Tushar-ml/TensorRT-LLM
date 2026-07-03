@@ -457,7 +457,7 @@ class ModelDrafter(Drafter):
         new_requests = []
         for req in draft_batch:
             target_model_req = self.req_id_to_old_request[req.py_request_id]
-            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+            if target_model_req.state not in (LlmRequestState.GENERATION_IN_PROGRESS, LlmRequestState.CONTEXT_INIT):
                 # This is a chunked prefill request and we have more prefill chunks
                 # to process. Defer adding draft tokens until the whole prompt is processed.
                 self.draft_seq_slot_manager.free_resources(req)
@@ -555,7 +555,7 @@ class ModelDrafter(Drafter):
         batch_size = target_inputs.new_tokens.shape[1]
         # Iterate through generation requests and copy tokens based on accepted draft tokens
         for request in scheduled_batch.all_requests():
-            if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+            if request.state in (LlmRequestState.GENERATION_IN_PROGRESS, LlmRequestState.CONTEXT_INIT):
                 has_draft_tokens = True
 
         if has_draft_tokens:
@@ -563,7 +563,8 @@ class ModelDrafter(Drafter):
             new_tokens_lens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=device)
-            new_tokens_lens += num_accepted_tokens_device
+            if num_accepted_tokens_device is not None:
+                new_tokens_lens += num_accepted_tokens_device
             next_draft_tokens = torch.zeros(batch_size,
                                             self.max_draft_len,
                                             dtype=torch.int,
@@ -587,7 +588,7 @@ class ModelDrafter(Drafter):
         target_indices = []
         for req_idx, request in enumerate(draft_batch.all_requests()):
             target_req = self.req_id_to_old_request[request.py_request_id]
-            if target_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+            if target_req.state not in (LlmRequestState.GENERATION_IN_PROGRESS, LlmRequestState.CONTEXT_INIT):
                 # Skip prefill requests
                 continue
             # Get the index of the draft/target tokens in the device tensor
@@ -683,7 +684,7 @@ class ModelDrafter(Drafter):
 
         for req_idx, req in enumerate(draft_batch.all_requests()):
             target_model_req = self.req_id_to_old_request[req.py_request_id]
-            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+            if target_model_req.state not in (LlmRequestState.GENERATION_IN_PROGRESS, LlmRequestState.CONTEXT_INIT):
                 # Chunked prefill request in progress; no need to append draft tokens
                 continue
             target_model_req.py_draft_tokens = []
