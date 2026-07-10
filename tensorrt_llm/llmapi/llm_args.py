@@ -4268,6 +4268,11 @@ class BaseLlmArgs(StrictBaseModel):
                 self.tokenizer,
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
+        if self.speculative_config is not None and self.tokenizer is not None:
+            from tensorrt_llm._torch.speculative.utils import \
+                update_thinking_phase_tokens_from_tokenizer
+            update_thinking_phase_tokens_from_tokenizer(
+                self.speculative_config, self.tokenizer)
         return self
 
     @model_validator(mode="after")
