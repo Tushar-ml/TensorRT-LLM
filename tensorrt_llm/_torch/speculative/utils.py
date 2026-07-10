@@ -438,6 +438,58 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
 
+_THINKING_BEGIN_MARKERS = ("<think>",)
+_THINKING_END_MARKERS = ("</think>",)
+
+
+def _encode_single_token(tokenizer, text: str) -> Optional[int]:
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None and hasattr(tokenizer, "tokenizer"):
+        encode = tokenizer.tokenizer.encode
+    if encode is None:
+        return None
+    token_ids = encode(text, add_special_tokens=False)
+    if len(token_ids) == 1:
+        return token_ids[0]
+    return None
+
+
+def update_thinking_phase_tokens_from_tokenizer(spec_config, tokenizer) -> None:
+    """Resolve thinking-phase token IDs from the model tokenizer."""
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return
+    if not spec_config.use_relaxed_acceptance_for_thinking or tokenizer is None:
+        return
+
+    begin_id = None
+    end_id = None
+    for marker in _THINKING_BEGIN_MARKERS:
+        begin_id = _encode_single_token(tokenizer, marker)
+        if begin_id is not None:
+            break
+    for marker in _THINKING_END_MARKERS:
+        end_id = _encode_single_token(tokenizer, marker)
+        if end_id is not None:
+            break
+
+    if begin_id is not None:
+        if begin_id != spec_config.begin_thinking_phase_token:
+            logger.info(
+                "MTP: resolved begin_thinking_phase_token=%s from tokenizer",
+                begin_id,
+            )
+        spec_config.begin_thinking_phase_token = begin_id
+    if end_id is not None:
+        if end_id != spec_config.end_thinking_phase_token:
+            logger.info(
+                "MTP: resolved end_thinking_phase_token=%s from tokenizer",
+                end_id,
+            )
+        spec_config.end_thinking_phase_token = end_id
+
+
 def update_spec_config_from_model_config(spec_config, model_config):
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
     if not isinstance(spec_config, MTPDecodingConfig):
